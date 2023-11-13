@@ -136,7 +136,8 @@ def draw_bounding_boxes(
             label_pos = (bbox[0] + margin, bbox[1] + margin)
             textbox = draw.textbbox(label_pos, label, font=txt_font)
             draw.rectangle(textbox, fill=color)
-            draw.text(label_pos, label, font=font, fill="black")
+            # txt_font = ImageFont.truetype(font=font, size=30)
+            draw.text(label_pos, label, font=txt_font, fill="black")
 
     return torch.from_numpy(np.array(img_to_draw)).permute(2, 0, 1).to(dtype=torch.uint8)
 
@@ -152,16 +153,15 @@ def list_replace(lst, old=1, new=10):
         pass
     return lst
 
-
 def main(
-        config_file="configs/open-vocabulary/lvis/vitl.yaml", 
+        config_file="configs/open-vocabulary/lvis/vitl.yaml",
         rpn_config_file="configs/RPN/mask_rcnn_R_50_FPN_1x.yaml",
-        model_path="weights/trained/open-vocabulary/lvis/vitl_0069999.pth", 
+        model_path="weights/trained/open-vocabulary/lvis/vitl_0069999.pth",
 
-        image_dir='demo/input', 
-        output_dir='demo/output', 
-        category_space="demo/ycb_prototypes.pth",
-        device='cpu',
+        image_dir='demo/d2s_input',
+        output_dir='demo/d2s_output',
+        category_space="demo/d2s_all_templates_each_object_prototypes.pth", #"demo/ycb_prototypes.pth",
+        device='cpu', #'cpu
         overlapping_mode=True,
         topk=1,
         output_pth=False,
@@ -254,7 +254,8 @@ def main(
             boxes = boxes[indexes]
             pred_classes = pred_classes[indexes]
         colors = assign_colors(pred_classes, label_names, seed=4)
-        output = to_pil_image(draw_bounding_boxes(torch.as_tensor(image).permute(2, 0, 1), boxes, labels=[label_names[cid] for cid in pred_classes.tolist()], colors=colors))
+        # font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        output = to_pil_image(draw_bounding_boxes(torch.as_tensor(image).permute(2, 0, 1), boxes, labels=[label_names[cid] for cid in pred_classes.tolist()], colors=colors, width=5, font="DejaVuSans-Bold.ttf", font_size=30))
         output.save(osp.join(output_dir, base_filename + '.out.jpg'))
 
 
