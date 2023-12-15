@@ -67,7 +67,7 @@ print(d2s_metadata)
 # print(dataset_dicts[0]["annotations"][0]["category_id"])
 # print(dataset_dicts[0]["annotations"][0]["iscrowd"])
 
-for d in dataset_dicts[:3]:#random.sample(dataset_dicts, 3):
+for d in dataset_dicts[400:800:100]:#random.sample(dataset_dicts, 3):
     img = cv2.imread(d["file_name"])
     print(d["image_id"])
     visualizer = Visualizer(img[:, :, ::-1], metadata=d2s_metadata, scale=0.5)
@@ -129,7 +129,7 @@ def main(
     evaluator = COCOEvaluator(dataset_name, output_dir="./output/")
     evaluator.reset()
     print('dataset_dicts', len(dataset_dicts))
-    for dataset_dict in tqdm(dataset_dicts[:3]):
+    for dataset_dict in tqdm(dataset_dicts[400:800:100]):
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
         img_file = dataset_dict["file_name"]
         image = utils.read_image(img_file, format="RGB")
@@ -190,13 +190,13 @@ def main(
             instances = Instances((dataset_dict["height"], dataset_dict["width"]))
             instances.pred_boxes = Boxes(boxes)
             instances.scores = scores
-            # visualize output
-            # colors = assign_colors(pred_classes, label_names, seed=4)
-            # output = to_pil_image(draw_bounding_boxes(torch.as_tensor(image).permute(2, 0, 1), boxes,
-            #                                           labels=[label_names[cid] for cid in pred_classes.tolist()],
-            #                                           colors=colors, width=5, font="DejaVuSans-Bold.ttf", font_size=30))
+            # # visualize output
+            colors = assign_colors(pred_classes, label_names, seed=4)
+            output = to_pil_image(draw_bounding_boxes(torch.as_tensor(image).permute(2, 0, 1), boxes,
+                                                      labels=[label_names[cid] for cid in pred_classes.tolist()],
+                                                      colors=colors, width=5, font="DejaVuSans-Bold.ttf", font_size=30))
             # # show pil image
-            # output.show()
+            output.show()
             updated_pred_classes = []
             # update pred_classes
             # print('before updating class', pred_classes)
@@ -215,7 +215,7 @@ def main(
             filter_output = {'instances': instances}
             evaluator.process([dataset_dict], [filter_output])
 
-    eval_results = evaluator.evaluate(img_ids=[200,201,202])
+    eval_results = evaluator.evaluate(img_ids=[910, 911, 912])
     print(eval_results)
 
 

@@ -36,6 +36,8 @@ from PIL import Image, ImageColor, ImageDraw, ImageFont
 from copy import copy
 
 
+
+
 def filter_boxes(instances, threshold=0.0):
     indexes = instances.scores >= threshold
     assert indexes.sum() > 0
@@ -160,10 +162,10 @@ def main(
 
         image_dir='demo/d2s_input',
         output_dir='demo/d2s_output',
-        category_space="demo/d2s_all_templates_each_object_prototypes.pth", #"demo/ycb_prototypes.pth",
-        device='cpu', #'cpu
+        category_space="demo/ycb_prototypes.pth",    #"demo/d2s_all_templates_each_object_prototypes.pth", #"demo/ycb_prototypes.pth",
+        device='cuda', #'cpu
         overlapping_mode=True,
-        topk=1,
+        topk=3,
         output_pth=False,
         threshold=0.45
     ):
@@ -235,8 +237,8 @@ def main(
                     for j in range(i+1, len(box_id_indexes)):
                         bid1 = box_id_indexes[i]
                         bid2 = box_id_indexes[j]
-                        arr1 = boxes[bid1].numpy()
-                        arr2 = boxes[bid2].numpy()
+                        arr1 = boxes[bid1].cpu().numpy()
+                        arr2 = boxes[bid2].cpu().numpy()
                         a1 = np.prod(arr1[2:] - arr1[:2])
                         a2 = np.prod(arr2[2:] - arr2[:2])
                         top_left = np.maximum(arr1[:2], arr2[:2]) # [[x, y]]

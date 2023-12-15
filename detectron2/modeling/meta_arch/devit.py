@@ -49,6 +49,28 @@ from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    # Efficient implementation equivalent to the following:
+    # copy from pytorch: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
 
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
@@ -1109,6 +1131,18 @@ class OpenSetDetectorWithExamples(nn.Module):
         if (self.training and (not self.only_train_mask)) or (not self.training):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
+            # use crossTransformers to get similarity matrix
+            class_similarity = []
+            for i in range(num_classes):
+                cur_class_weights = torch.randn(20, 1024).to(roi_features)  # Value tensor
+                class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
+                # roi_features as query vectors, prototype as key vectors and value vectors
+                query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
+                class_similarity.append(cur_class_similarity)
+
+            class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
             # (N x spatial x emb) @ (emb x class) = N x spatial x class
             feats = roi_features.transpose(-2, -1) @ class_weights.T
 
