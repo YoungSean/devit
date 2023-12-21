@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torchvision.ops as ops
 import fire
 torch.set_grad_enabled(False)
 from torchvision import transforms
@@ -22,6 +23,7 @@ from fast_pytorch_kmeans import KMeans
 import lib.data.fewshot
 import lib.data.ovdshot
 import lib.data.lvis
+from matplotlib import pyplot as plt
 
 
 pixel_mean = torch.Tensor([123.675, 116.280, 103.530]).view(3, 1, 1)
@@ -158,7 +160,7 @@ def get_dataloader(dname, aug=False, split=0, idx=0):
 # fs_coco_trainval_base
 # fs_coco_trainval_novel_{5, 10, 30}shot
 
-def main(model='vitl14', dataset='fs_coco17_support_novel_30shot', use_bbox='yes',
+def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
             epochs=1, device=0, n_clst=5, split=0, idx=0, out_dir=None):
     use_bbox = use_bbox == 'yes'
     dataset_name = dataset
@@ -189,7 +191,7 @@ def main(model='vitl14', dataset='fs_coco17_support_novel_30shot', use_bbox='yes
     if 'stuff' in dataset_name: # for background 
         meta = MetadataCatalog.get(dataset_name)
         stuff_id_set = set(meta.stuff_dataset_id_to_contiguous_id.values())
-
+    total = 0
     with tqdm(total=epochs * len(dataloader)) as bar:
         for _ in range(epochs):
             for item_i, item in enumerate(dataloader):
@@ -230,23 +232,57 @@ def main(model='vitl14', dataset='fs_coco17_support_novel_30shot', use_bbox='yes
                                                 instances.gt_boxes.tensor):
                         bmask = bmask.float()[None, ...]
                         bmask = tvF.resize(bmask, target_mask_size)
+
+
+
                         if bmask.sum() <= 0.5:
                             dataset['skip'] += 1
                             continue
+
+                        # Find the indices of True values
+                        true_indices = torch.nonzero(bmask[0])
+                        # Calculate bounding box coordinates
+                        min_x = true_indices[:, 1].min().item()
+                        max_x = true_indices[:, 1].max().item()
+                        min_y = true_indices[:, 0].min().item()
+                        max_y = true_indices[:, 0].max().item()
+
+                        # Form the bounding box as (min_x, min_y, max_x, max_y)
+                        # this is the resized bbox for feature map
+                        bounding_box = (min_x, min_y, max_x, max_y)
+                        # Crop the region of interest (RoI) from the feature map
+                        # roi = patch_tokens[:, bounding_box[1]:bounding_box[3] + 1, bounding_box[0]:bounding_box[2] + 1]
+                        # print("RoI shape:", roi.shape)
+
+                        # Define the output size for RoI Align
+                        output_size = 7
+                        bounding_box = torch.Tensor(bounding_box).unsqueeze(0).to(device)
+                        # Use RoI Align to get the cropped RoI
+                        roi_align = ops.roi_align(patch_tokens.unsqueeze(0), [bounding_box], output_size=output_size)
+
+                        # The result will be the resized RoI
+                        print("Resized RoI shape:", roi_align.shape)
+
+                        # compute the average token
                         avg_patch_token = (bmask * patch_tokens).flatten(1).sum(1) / bmask.sum()
 
                         dataset['avg_patch_tokens'].append(avg_patch_token.cpu())
                         dataset['labels'].append(label.cpu().item())
                         bbox = bbox.cpu()
+                        print("gt boxes: ", bbox)
                         # dataset['boxes'].append(bbox.cpu()) 
                         # dataset['areas'].append(((bbox[3] - bbox[1]) * (bbox[2] - bbox[0])).item())
                         dataset['image_id'].append(item['image_id'])
-                
+                    sys.exit()
+                    total += 1
+
+                if total == 200:
+                    break
                 bar.update()
     name = dataset_name + '.' + model_name
 
-    if use_aug:
-        name += '.aug'
+    # if use_aug:
+    #     name += '.aug'
 
     if 'stuff' in dataset_name:
         name += f'.c{n_clst}'

@@ -1131,18 +1131,18 @@ class OpenSetDetectorWithExamples(nn.Module):
         if (self.training and (not self.only_train_mask)) or (not self.training):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
-            # use crossTransformers to get similarity matrix
-            class_similarity = []
-            for i in range(num_classes):
-                cur_class_weights = torch.randn(20, 1024).to(roi_features)  # Value tensor
-                class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
-                # roi_features as query vectors, prototype as key vectors and value vectors
-                query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
-                result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
-                cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
-                class_similarity.append(cur_class_similarity)
-
-            class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
+            # # use crossTransformers to get similarity matrix
+            # class_similarity = []
+            # for i in range(num_classes):
+            #     cur_class_weights = torch.randn(20, 1024).to(roi_features)  # Value tensor
+            #     class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
+            #     # roi_features as query vectors, prototype as key vectors and value vectors
+            #     query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+            #     result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+            #     cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
+            #     class_similarity.append(cur_class_similarity)
+            #
+            # class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
             # (N x spatial x emb) @ (emb x class) = N x spatial x class
             feats = roi_features.transpose(-2, -1) @ class_weights.T
 
