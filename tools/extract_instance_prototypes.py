@@ -160,7 +160,7 @@ def get_dataloader(dname, aug=False, split=0, idx=0):
 # fs_coco_trainval_base
 # fs_coco_trainval_novel_{5, 10, 30}shot
 
-def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
+def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
             epochs=1, device=0, n_clst=5, split=0, idx=0, out_dir=None):
     use_bbox = use_bbox == 'yes'
     dataset_name = dataset
@@ -185,7 +185,8 @@ def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
         'image_id': [],
         'boxes': [],
         'areas': [],
-        'skip': 0
+        'skip': 0,
+        'RoI_feature_tokens': [],
     }
 
     if 'stuff' in dataset_name: # for background 
@@ -196,6 +197,8 @@ def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
         for _ in range(epochs):
             for item_i, item in enumerate(dataloader):
                 item = item[0]
+                # print(item)
+                # sys.exit()
                 if 'instances' in item:
                     instances = item['instances'].to(device)
                 image = item['image'].clone()
@@ -259,27 +262,31 @@ def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
                         bounding_box = torch.Tensor(bounding_box).unsqueeze(0).to(device)
                         # Use RoI Align to get the cropped RoI
                         roi_align = ops.roi_align(patch_tokens.unsqueeze(0), [bounding_box], output_size=output_size)
-
+                        roi_align = roi_align.squeeze(0).half()
+                        # print("RoI shape:", roi_align.shape)
+                        # print("ROI dtype: ", roi_align.dtype)
+                        dataset['RoI_feature_tokens'].append(roi_align.cpu())
                         # The result will be the resized RoI
-                        print("Resized RoI shape:", roi_align.shape)
+                        # print("Resized RoI shape:", roi_align.shape)
 
                         # compute the average token
-                        avg_patch_token = (bmask * patch_tokens).flatten(1).sum(1) / bmask.sum()
+                        # avg_patch_token = (bmask * patch_tokens).flatten(1).sum(1) / bmask.sum()
 
-                        dataset['avg_patch_tokens'].append(avg_patch_token.cpu())
+                        # dataset['avg_patch_tokens'].append(avg_patch_token.cpu())
                         dataset['labels'].append(label.cpu().item())
                         bbox = bbox.cpu()
-                        print("gt boxes: ", bbox)
+                        # print("gt boxes: ", bbox)
                         # dataset['boxes'].append(bbox.cpu()) 
                         # dataset['areas'].append(((bbox[3] - bbox[1]) * (bbox[2] - bbox[0])).item())
                         dataset['image_id'].append(item['image_id'])
-                    sys.exit()
+                    # sys.exit()
                     total += 1
 
-                if total == 200:
-                    break
+
                 bar.update()
-    name = dataset_name + '.' + model_name
+                if total == 5000:
+                    break
+    name = dataset_name + '.' + model_name+"_"+str(total)+"_samples"
 
     # if use_aug:
     #     name += '.aug'

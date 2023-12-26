@@ -27,7 +27,7 @@ from detectron2.data.datasets.coco_zeroshot_categories import COCO_SEEN_CLS, \
 from ..roi_heads import build_roi_heads
 from ..matcher import Matcher
 from .build import META_ARCH_REGISTRY
-
+from collections import defaultdict
 
 from PIL import Image
 import copy
@@ -637,6 +637,15 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         if use_one_shot:
             self.one_shot_ref = torch.load(one_shot_reference)
+
+        # uses RoI to generate similarity matrix
+        cur_patchs = "fs_coco_trainval_base.vitb14_5000_samples.bbox.pkl"
+        coco60 = torch.load(cur_patchs)
+        labels = coco60['labels']
+        self.RoIs_list = coco60['RoI_feature_tokens']
+        self.label_idx = defaultdict(list)
+        for idx, label in enumerate(labels):
+            self.label_idx[label].append(idx)
         
         # ---------- mask related layers --------- # 
         self.only_train_mask = only_train_mask if use_mask else False
@@ -1131,20 +1140,39 @@ class OpenSetDetectorWithExamples(nn.Module):
         if (self.training and (not self.only_train_mask)) or (not self.training):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
+            # get the sample RoI feature maps
+            class_RoIs = {}
+            for label, idxs in self.label_idx.items():
+                # print(label, len(idxs))
+                # Select 8 elements without replacement
+                selected_elements = random.sample(idxs, 8)
+                selected_RoIs = [self.RoIs_list[i].flatten(1) for i in selected_elements]
+                RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                class_RoIs[label] = RoIs
+
+            # print(class_RoIs)
+            RoI_prototypes = []
+            for i in range(len(class_RoIs)):
+                # print(class_RoIs[i].shape)
+                RoI_prototypes.append(class_RoIs[i])
+            RoI_prototypes = torch.stack(RoI_prototypes, dim=0)
+
             # # use crossTransformers to get similarity matrix
-            # class_similarity = []
-            # for i in range(num_classes):
-            #     cur_class_weights = torch.randn(20, 1024).to(roi_features)  # Value tensor
-            #     class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
-            #     # roi_features as query vectors, prototype as key vectors and value vectors
-            #     query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
-            #     result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
-            #     cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
-            #     class_similarity.append(cur_class_similarity)
-            #
-            # class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
+            class_similarity = []
+            for i in range(num_classes):
+                cur_class_weights = RoI_prototypes[i].to(roi_features)  # Value tensor
+                class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
+                # roi_features as query vectors, prototype as key vectors and value vectors
+                query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
+                class_similarity.append(cur_class_similarity)
+
+            class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
+            feats = class_similarity
+
             # (N x spatial x emb) @ (emb x class) = N x spatial x class
-            feats = roi_features.transpose(-2, -1) @ class_weights.T
+            # feats = roi_features.transpose(-2, -1) @ class_weights.T
 
             # sample topk classes
             class_topk = self.num_sample_class
