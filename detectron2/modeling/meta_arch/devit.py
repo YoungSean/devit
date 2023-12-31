@@ -49,6 +49,9 @@ from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+
+random.seed(10)
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
     # Efficient implementation equivalent to the following:
     # copy from pytorch: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
@@ -72,6 +75,23 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
 
+class CrossAttention(nn.Module):
+    def __init__(self, embed_size):
+        super(CrossAttention, self).__init__()
+        self.query_linear = nn.Linear(embed_size, embed_size)
+        self.key_linear = nn.Linear(embed_size, embed_size)
+        self.value_linear = nn.Linear(embed_size, embed_size)
+
+    def forward(self, query, key, value, mask=None):
+        # Apply linear transformations
+        query_transformed = self.query_linear(query)
+        key_transformed = self.key_linear(key)
+        value_transformed = self.value_linear(value)
+
+        # Scaled dot-product attention
+        output = scaled_dot_product_attention(query_transformed, key_transformed, value_transformed, attn_mask=mask)
+
+        return output
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
     Generalized IoU from https://giou.stanford.edu/
@@ -468,6 +488,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         
         # class_prototypes_file
         #  prototypes, class_order_for_inference
+        print("class_prototypes_file", class_prototypes_file)
         if isinstance(class_prototypes_file, str):
             dct = torch.load(class_prototypes_file)
             prototypes = dct['prototypes']
@@ -514,17 +535,24 @@ class OpenSetDetectorWithExamples(nn.Module):
                 prototype_label_names.append(c)
                 mask_cids.append(c)
                 class_weights = torch.cat([class_weights, torch.zeros(1, class_weights.shape[-1])], dim=0)
-        
+
+        print("prototype_label_names", prototype_label_names)
+        print("length of prototype_label_names", len(prototype_label_names))
+        print("60th prototype label name", prototype_label_names[60])
         train_class_order = [prototype_label_names.index(c) for c in seen_cids]
         test_class_order = [prototype_label_names.index(c) for c in all_cids]
 
         self.label_names = prototype_label_names
 
         assert -1 not in train_class_order and -1 not in test_class_order
-
+        # print("class weights", class_weights.shape)
         self.register_buffer("train_class_weight", class_weights[torch.as_tensor(train_class_order)])
         self.register_buffer("test_class_weight", class_weights[torch.as_tensor(test_class_order)])
         self.test_class_order = test_class_order
+        # print("train_class_weight", self.train_class_weight.shape)
+        # print("test_class_weight", self.test_class_weight.shape)
+        # print("train_class_order", train_class_order)
+        # print("test_class_order", test_class_order)
 
         self.all_labels = all_cids
         self.seen_labels = seen_cids
@@ -639,13 +667,25 @@ class OpenSetDetectorWithExamples(nn.Module):
             self.one_shot_ref = torch.load(one_shot_reference)
 
         # uses RoI to generate similarity matrix
-        cur_patchs = "fs_coco_trainval_base.vitb14_5000_samples.bbox.pkl"
+        cur_patchs = "fs_coco_trainval_base.vitb14_10000_samples.bbox.pkl"
+
         coco60 = torch.load(cur_patchs)
         labels = coco60['labels']
-        self.RoIs_list = coco60['RoI_feature_tokens']
-        self.label_idx = defaultdict(list)
+        self.train_RoIs_list = coco60['RoI_feature_tokens']
+        self.train_label_idx = defaultdict(list)
         for idx, label in enumerate(labels):
-            self.label_idx[label].append(idx)
+            self.train_label_idx[label].append(idx)
+
+        #test_cur_patchs = "fs_coco_test_all.vitb14_4954_samples.bbox.pkl"
+        test_cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples_label60_79.bbox.pkl"
+        test_coco = torch.load(test_cur_patchs)
+        test_labels = test_coco['labels']
+        self.test_RoIs_list = test_coco['RoI_feature_tokens']
+        self.test_label_idx = defaultdict(list)
+        for idx, label in enumerate(test_labels):
+            self.test_label_idx[label].append(idx)
+
+        self.cross_attn = CrossAttention(class_weights.shape[-1])
         
         # ---------- mask related layers --------- # 
         self.only_train_mask = only_train_mask if use_mask else False
@@ -998,9 +1038,17 @@ class OpenSetDetectorWithExamples(nn.Module):
         loss_dict = {}
         if not self.training: assert bs == 1
 
+        self.sample_num = 20
+        use_novel_sample = False
         if self.training:
             class_weights = self.train_class_weight
+            self.label_idx = self.train_label_idx
+            self.RoIs_list = self.train_RoIs_list
         else:
+            # self.label_idx = self.test_label_idx
+            # self.RoIs_list = self.test_RoIs_list
+            self.sample_num = 20
+            use_novel_sample = True
             if self.use_one_shot:
                 # assemble weights on the fly
                 class_weights = []
@@ -1014,9 +1062,13 @@ class OpenSetDetectorWithExamples(nn.Module):
                 class_weights = F.normalize(torch.stack(class_weights), dim=-1)
                 class_weights = class_weights.to(self.device)
             else:
+                # print("using the test class weight")
+                # print("num_classes", len(self.test_class_weight))
                 class_weights = self.test_class_weight
+                # print("class_weights", class_weights.shape)
 
         num_classes = len(class_weights)
+        # print("num_classes", num_classes)
 
         with torch.no_grad():
             # with autocast(enabled=True):
@@ -1142,29 +1194,56 @@ class OpenSetDetectorWithExamples(nn.Module):
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
             # get the sample RoI feature maps
             class_RoIs = {}
+            sample_num = self.sample_num
             for label, idxs in self.label_idx.items():
                 # print(label, len(idxs))
-                # Select 8 elements without replacement
-                selected_elements = random.sample(idxs, 8)
-                selected_RoIs = [self.RoIs_list[i].flatten(1) for i in selected_elements]
+                if len(idxs) < sample_num:
+                    selected_elements = [i for i in range(len(idxs))]
+                    # print(selected_elements)
+                else:
+                    # randomly select 20 RoIs without replacement
+                    selected_elements = random.sample(idxs, sample_num)
+                selected_RoIs = [self.RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
                 RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                if RoIs.shape[0] < sample_num:
+                    RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
                 class_RoIs[label] = RoIs
 
+            if use_novel_sample:
+                for label, idxs in self.test_label_idx.items():
+                    # print(label, len(idxs))
+                    if len(idxs) < sample_num:
+                        selected_elements = [i for i in range(len(idxs))]
+                        # print(selected_elements)
+                    else:
+                        # randomly select 20 RoIs without replacement
+                        selected_elements = random.sample(idxs, sample_num)
+                    selected_RoIs = [self.test_RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
+                    RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                    if RoIs.shape[0] < sample_num:
+                        RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
+                    class_RoIs[label] = RoIs
+
             # print(class_RoIs)
-            RoI_prototypes = []
-            for i in range(len(class_RoIs)):
-                # print(class_RoIs[i].shape)
-                RoI_prototypes.append(class_RoIs[i])
-            RoI_prototypes = torch.stack(RoI_prototypes, dim=0)
+            # RoI_prototypes = []
+            # for i in range(len(class_RoIs)):
+            #     # print(class_RoIs[i].shape)
+            #     RoI_prototypes.append(class_RoIs[i])
+            # RoI_prototypes = torch.stack(RoI_prototypes, dim=0)
 
             # # use crossTransformers to get similarity matrix
             class_similarity = []
             for i in range(num_classes):
-                cur_class_weights = RoI_prototypes[i].to(roi_features)  # Value tensor
+                cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
                 class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
                 # roi_features as query vectors, prototype as key vectors and value vectors
                 query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
-                result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                # result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                # attn_mask = None
+                # if class_feats.shape[1] < self.sample_num:
+                #     attn_mask = torch.zeros(bs, spatial_size, self.sample_num, device=self.device)
+                #     attn_mask[:, :, class_feats.shape[1]:] = -1e9
+                result = self.cross_attn(query_feature, class_feats, class_feats)
                 cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
                 class_similarity.append(cur_class_similarity)
 

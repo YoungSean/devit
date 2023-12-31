@@ -160,7 +160,7 @@ def get_dataloader(dname, aug=False, split=0, idx=0):
 # fs_coco_trainval_base
 # fs_coco_trainval_novel_{5, 10, 30}shot
 
-def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
+def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
             epochs=1, device=0, n_clst=5, split=0, idx=0, out_dir=None):
     use_bbox = use_bbox == 'yes'
     dataset_name = dataset
@@ -171,6 +171,7 @@ def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
     D = DatasetCatalog.get(dataset_name)
     thing_cats = {b['category_id'] for a in D  for b in a.get('annotations', [])}
     print(f'Found thing categories: {len(thing_cats)}')
+    print(MetadataCatalog.get(dataset_name).thing_classes)
     
     if device != 'cpu':
         device = int(device)
@@ -262,7 +263,7 @@ def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
                         bounding_box = torch.Tensor(bounding_box).unsqueeze(0).to(device)
                         # Use RoI Align to get the cropped RoI
                         roi_align = ops.roi_align(patch_tokens.unsqueeze(0), [bounding_box], output_size=output_size)
-                        roi_align = roi_align.squeeze(0).half()
+                        roi_align = roi_align.squeeze(0)  #.half()
                         # print("RoI shape:", roi_align.shape)
                         # print("ROI dtype: ", roi_align.dtype)
                         dataset['RoI_feature_tokens'].append(roi_align.cpu())
@@ -284,7 +285,7 @@ def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
 
 
                 bar.update()
-                if total == 5000:
+                if total == 10000:
                     break
     name = dataset_name + '.' + model_name+"_"+str(total)+"_samples"
 
