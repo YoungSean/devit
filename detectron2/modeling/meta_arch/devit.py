@@ -551,9 +551,10 @@ class OpenSetDetectorWithExamples(nn.Module):
         self.test_class_order = test_class_order
         # print("train_class_weight", self.train_class_weight.shape)
         # print("test_class_weight", self.test_class_weight.shape)
-        # print("train_class_order", train_class_order)
-        # print("test_class_order", test_class_order)
+        print("train_class_order", train_class_order)
+        print("test_class_order", test_class_order)
 
+        self.coco_test_class_order = test_class_order
         self.all_labels = all_cids
         self.seen_labels = seen_cids
 
@@ -1233,7 +1234,10 @@ class OpenSetDetectorWithExamples(nn.Module):
 
             # # use crossTransformers to get similarity matrix
             class_similarity = []
-            for i in range(num_classes):
+            class_order = range(num_classes)
+            if use_novel_sample:
+                class_order = self.coco_test_class_order
+            for i in class_order:
                 cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
                 class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
                 # roi_features as query vectors, prototype as key vectors and value vectors
