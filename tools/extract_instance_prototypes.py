@@ -160,7 +160,7 @@ def get_dataloader(dname, aug=False, split=0, idx=0):
 # fs_coco_trainval_base
 # fs_coco_trainval_novel_{5, 10, 30}shot
 
-def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
+def main(model='vitb14', dataset='fs_coco_trainval_base', use_bbox='yes',
             epochs=1, device=0, n_clst=5, split=0, idx=0, out_dir=None):
     use_bbox = use_bbox == 'yes'
     dataset_name = dataset
@@ -283,10 +283,9 @@ def main(model='vitb14', dataset='fs_coco_trainval_novel_5shot', use_bbox='yes',
                     # sys.exit()
                     total += 1
 
-
                 bar.update()
-                if total == 10000:
-                    break
+                # if total == 10000:
+                #     break
     name = dataset_name + '.' + model_name+"_"+str(total)+"_samples"
 
     # if use_aug:

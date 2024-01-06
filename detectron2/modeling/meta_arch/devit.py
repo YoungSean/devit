@@ -6,7 +6,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from numpy.lib import pad
 import torch
-from torch import nn
+from torch import nn, einsum
 from torch.nn import functional as F
 from random import randint
 from torch.cuda.amp import autocast
@@ -48,6 +48,36 @@ from detectron2.structures.masks import PolygonMasks
 from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
+
+# from cross_transformers_pytorch import CrossTransformer
+from einops import rearrange
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        # Assuming kernel_size=3, stride=1, and padding=1 to maintain the spatial dimensions
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity  # Adding the input (identity) to the output
+        out = F.relu(out)
+        return out
+
+class ResNetLikeCNN(nn.Module):
+    def __init__(self, num_blocks, channels=768):
+        super(ResNetLikeCNN, self).__init__()
+        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
+
+    def forward(self, x):
+        return self.blocks(x)
+
+# Example usage
 
 
 random.seed(10)
@@ -92,6 +122,70 @@ class CrossAttention(nn.Module):
         output = scaled_dot_product_attention(query_transformed, key_transformed, value_transformed, attn_mask=mask)
 
         return output
+
+
+class SimpleCrossTransformer(nn.Module):
+    def __init__(
+            self,
+            dim=512,
+            dim_key=128,
+            dim_value=128
+    ):
+        super().__init__()
+        self.scale = dim_key ** -0.5
+        self.to_qk = nn.Conv2d(dim, dim_key, kernel_size=1, bias=False)
+        self.to_v = nn.Conv2d(dim, dim_value, kernel_size=1, bias=False)
+
+    def forward(self, model, img_query, img_supports):
+        """
+        dimensions names:
+
+        b - batch
+        k - num classes
+        n - num images in a support class
+        c - channels
+        h, i - height
+        w, j - width
+        """
+
+        b, k, *_ = img_supports.shape
+
+        query_repr = model(img_query)
+        bs, _, h, w = query_repr.shape
+
+        img_supports = rearrange(img_supports, 'b k n c h w -> (b k n) c h w', b=b)  # b set to 1
+        supports_repr = model(img_supports)
+
+        query_q, query_v = self.to_qk(query_repr), self.to_v(query_repr)
+
+        supports_k, supports_v = self.to_qk(supports_repr), self.to_v(supports_repr)
+        # # use attention
+        # query_q = rearrange(query_q, 'b c h w -> b (h w) c')
+        # query_v = rearrange(query_v, 'b c h w -> b (h w) c')
+        # supports_k = rearrange(supports_k, 'b c h w -> b (h w) c').repeat(bs, 1, 1)
+        # supports_v = rearrange(supports_v, 'b c h w -> b (h w) c').repeat(bs, 1, 1)
+        #
+        # out = scaled_dot_product_attention(query_q, supports_k, supports_v)
+
+        supports_k, supports_v = map(lambda t: rearrange(t, '(b k n) c h w -> b k n c h w', b=b, k=k),
+                                     (supports_k, supports_v))
+
+        supports_k = supports_k.repeat(bs, 1, 1, 1, 1, 1)
+        supports_v = supports_v.repeat(bs, 1, 1, 1, 1, 1)
+        sim = einsum('b c h w, b k n c i j -> b k h w n i j', query_q, supports_k) * self.scale
+        sim = rearrange(sim, 'b k h w n i j -> b k h w (n i j)')
+
+        attn = sim.softmax(dim=-1)
+        attn = rearrange(attn, 'b k h w (n i j) -> b k h w n i j', i=h, j=w)
+
+        out = einsum('b k h w n i j, b k n c i j -> b k c h w', attn, supports_v)
+
+        out = rearrange(out, 'b k c h w -> b k (c h w)')
+        query_v = rearrange(query_v, 'b c h w -> b () (c h w)')
+        #
+        euclidean_dist = ((query_v - out) ** 2).sum(dim=-1) / (h * w)
+        return -euclidean_dist
+
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
     Generalized IoU from https://giou.stanford.edu/
@@ -545,14 +639,14 @@ class OpenSetDetectorWithExamples(nn.Module):
         self.label_names = prototype_label_names
 
         assert -1 not in train_class_order and -1 not in test_class_order
-        # print("class weights", class_weights.shape)
+        print("class weights", class_weights.shape)
         self.register_buffer("train_class_weight", class_weights[torch.as_tensor(train_class_order)])
         self.register_buffer("test_class_weight", class_weights[torch.as_tensor(test_class_order)])
         self.test_class_order = test_class_order
         # print("train_class_weight", self.train_class_weight.shape)
         # print("test_class_weight", self.test_class_weight.shape)
-        print("train_class_order", train_class_order)
-        print("test_class_order", test_class_order)
+        # print("train_class_order", train_class_order)
+        # print("test_class_order", test_class_order)
 
         self.coco_test_class_order = test_class_order
         self.all_labels = all_cids
@@ -667,26 +761,42 @@ class OpenSetDetectorWithExamples(nn.Module):
         if use_one_shot:
             self.one_shot_ref = torch.load(one_shot_reference)
 
-        # uses RoI to generate similarity matrix
-        cur_patchs = "fs_coco_trainval_base.vitb14_10000_samples.bbox.pkl"
+        self.use_class_weights = False
+        if self.use_class_weights:
+            print("Only using class weights / prototypes for classification")
+            self.train_RoIs_list = None
+            self.train_label_idx = None
+            self.test_RoIs_list = None
+            self.test_label_idx = None
+            self.cross_attn = None
+        else:
+            # uses RoI to generate similarity matrix
+            # cur_patchs = "fs_coco_trainval_base.vitb14_10000_samples.bbox.pkl"
+            cur_patchs = "fs_coco_trainval_base.vitb14_98459_samples.bbox.pkl"
+            coco60 = torch.load(cur_patchs)
+            labels = coco60['labels']
+            self.train_RoIs_list = coco60['RoI_feature_tokens']
+            self.train_label_idx = defaultdict(list)
+            for idx, label in enumerate(labels):
+                self.train_label_idx[label].append(idx)
 
-        coco60 = torch.load(cur_patchs)
-        labels = coco60['labels']
-        self.train_RoIs_list = coco60['RoI_feature_tokens']
-        self.train_label_idx = defaultdict(list)
-        for idx, label in enumerate(labels):
-            self.train_label_idx[label].append(idx)
+            #test_cur_patchs = "fs_coco_test_all.vitb14_4954_samples.bbox.pkl"
+            test_cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples_label60_79.bbox.pkl"
+            test_coco = torch.load(test_cur_patchs)
+            test_labels = test_coco['labels']
+            self.test_RoIs_list = test_coco['RoI_feature_tokens']
+            self.test_label_idx = defaultdict(list)
+            for idx, label in enumerate(test_labels):
+                self.test_label_idx[label].append(idx)
 
-        #test_cur_patchs = "fs_coco_test_all.vitb14_4954_samples.bbox.pkl"
-        test_cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples_label60_79.bbox.pkl"
-        test_coco = torch.load(test_cur_patchs)
-        test_labels = test_coco['labels']
-        self.test_RoIs_list = test_coco['RoI_feature_tokens']
-        self.test_label_idx = defaultdict(list)
-        for idx, label in enumerate(test_labels):
-            self.test_label_idx[label].append(idx)
-
-        self.cross_attn = CrossAttention(class_weights.shape[-1])
+            self.cross_attn = CrossAttention(class_weights.shape[-1])
+            # Define the model
+            # self.ctx_cnn_model = ResNetLikeCNN(num_blocks=1).to(self.device)
+            # self.cross_transformer = SimpleCrossTransformer(
+            #         dim = class_weights.shape[-1],
+            #         dim_key = 128,
+            #         dim_value = 128
+            #     ).to(self.device)
         
         # ---------- mask related layers --------- # 
         self.only_train_mask = only_train_mask if use_mask else False
@@ -1039,7 +1149,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         loss_dict = {}
         if not self.training: assert bs == 1
 
-        self.sample_num = 20
+        self.sample_num = 64
         use_novel_sample = False
         if self.training:
             class_weights = self.train_class_weight
@@ -1048,7 +1158,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         else:
             # self.label_idx = self.test_label_idx
             # self.RoIs_list = self.test_RoIs_list
-            self.sample_num = 20
+            self.sample_num = 64
             use_novel_sample = True
             if self.use_one_shot:
                 # assemble weights on the fly
@@ -1187,75 +1297,102 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         roi_features = self.roi_align(patch_tokens, rois) # N, C, k, k
         roi_bs = len(roi_features)
+        # original_roi_features = roi_features
 
         # roi_features # N x emb x spatial
         #%% #! Classification
         if (self.training and (not self.only_train_mask)) or (not self.training):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
-            # get the sample RoI feature maps
-            class_RoIs = {}
-            sample_num = self.sample_num
-            for label, idxs in self.label_idx.items():
-                # print(label, len(idxs))
-                if len(idxs) < sample_num:
-                    selected_elements = [i for i in range(len(idxs))]
-                    # print(selected_elements)
-                else:
-                    # randomly select 20 RoIs without replacement
-                    selected_elements = random.sample(idxs, sample_num)
-                selected_RoIs = [self.RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
-                RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
-                if RoIs.shape[0] < sample_num:
-                    RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
-                class_RoIs[label] = RoIs
-
-            if use_novel_sample:
-                for label, idxs in self.test_label_idx.items():
+            if self.use_class_weights:
+            # (N x spatial x emb) @ (emb x class) = N x spatial x class
+                feats = roi_features.transpose(-2, -1) @ class_weights.T
+            else:
+                # get the sample RoI feature maps
+                class_RoIs = {}
+                sample_num = self.sample_num
+                for label, idxs in self.label_idx.items():
                     # print(label, len(idxs))
                     if len(idxs) < sample_num:
-                        selected_elements = [i for i in range(len(idxs))]
+                        selected_elements = [i for i in idxs]
                         # print(selected_elements)
                     else:
                         # randomly select 20 RoIs without replacement
                         selected_elements = random.sample(idxs, sample_num)
-                    selected_RoIs = [self.test_RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
+                    selected_RoIs = [self.RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
                     RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
                     if RoIs.shape[0] < sample_num:
                         RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
                     class_RoIs[label] = RoIs
 
-            # print(class_RoIs)
-            # RoI_prototypes = []
-            # for i in range(len(class_RoIs)):
-            #     # print(class_RoIs[i].shape)
-            #     RoI_prototypes.append(class_RoIs[i])
-            # RoI_prototypes = torch.stack(RoI_prototypes, dim=0)
+                    # selected_RoIs = [self.RoIs_list[i] for i in selected_elements]
+                    # RoIs = torch.stack(selected_RoIs, dim=0)
+                    # if RoIs.shape[0] < sample_num:
+                    #     RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)], dim=0)
+                    # class_RoIs[label] = RoIs
 
-            # # use crossTransformers to get similarity matrix
-            class_similarity = []
-            class_order = range(num_classes)
-            if use_novel_sample:
-                class_order = self.coco_test_class_order
-            for i in class_order:
-                cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
-                class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
-                # roi_features as query vectors, prototype as key vectors and value vectors
-                query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
-                # result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
-                # attn_mask = None
-                # if class_feats.shape[1] < self.sample_num:
-                #     attn_mask = torch.zeros(bs, spatial_size, self.sample_num, device=self.device)
-                #     attn_mask[:, :, class_feats.shape[1]:] = -1e9
-                result = self.cross_attn(query_feature, class_feats, class_feats)
-                cur_class_similarity = torch.mean((result - query_feature) ** 2, dim=-1)
-                class_similarity.append(cur_class_similarity)
+                if use_novel_sample:
+                    for label, idxs in self.test_label_idx.items():
+                        # print(label, len(idxs))
+                        if len(idxs) < sample_num:
+                            selected_elements = [i for i in idxs]
+                            # print(selected_elements)
+                        else:
+                            # randomly select 20 RoIs without replacement
+                            selected_elements = random.sample(idxs, sample_num)
+                        selected_RoIs = [self.test_RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
+                        RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                        if RoIs.shape[0] < sample_num:
+                            RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
+                        class_RoIs[label] = RoIs
 
-            class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
-            feats = class_similarity
+                        # selected_RoIs = [self.test_RoIs_list[i] for i in selected_elements]
+                        # RoIs = torch.stack(selected_RoIs, dim=0)
+                        # if RoIs.shape[0] < sample_num:
+                        #     RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)],
+                        #                      dim=0)
+                        # class_RoIs[label] = RoIs
 
-            # (N x spatial x emb) @ (emb x class) = N x spatial x class
-            # feats = roi_features.transpose(-2, -1) @ class_weights.T
+                # # use crossTransformers to get similarity matrix
+
+                class_order = range(num_classes)
+                if use_novel_sample:
+                    class_order = self.coco_test_class_order
+
+                # sorted_tensors = []
+                # for i in class_order:
+                #     sorted_tensors.append(class_RoIs[i].to(roi_features))
+                # img_supports = torch.stack(sorted_tensors, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # # img_supports = img_supports.repeat(bs, 1, 1, 1, 1)  # bs x class x sample_num x C x K x K
+                # img_supports = img_supports[None, :, :, :, :, :]
+                # img_query = original_roi_features # batch, C, K, K
+                # feats = self.cross_transformer(self.ctx_cnn_model, img_query, img_supports)
+                class_similarity = []
+                for i in class_order:
+                    cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
+                    class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
+                    # roi_features as query vectors, prototype as key vectors and value vectors
+                    query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                    # result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                    # attn_mask = None
+                    # if class_feats.shape[1] < self.sample_num:
+                    #     attn_mask = torch.zeros(bs, spatial_size, self.sample_num, device=self.device)
+                    #     attn_mask[:, :, class_feats.shape[1]:] = -1e9
+                    result = self.cross_attn(query_feature, class_feats, class_feats)
+                    cur_class_similarity = - torch.mean((result - query_feature) ** 2, dim=-1)
+                    class_similarity.append(cur_class_similarity)
+
+                class_similarity = torch.stack(class_similarity, dim=2)  # N x spatial x num_classes. e.g. 1000 x 49 x 34. 34 is the number of classes
+                feats = class_similarity
+
+                # Sort the dictionary by keys and extract tensors
+                # sorted_tensors = [class_RoIs[k].mean(dim=0) for k in sorted(class_RoIs)]
+                # print('sorted tensor[0] shape', sorted_tensors[0].shape)
+
+                # Concatenate the tensors and reset class weights as the mean of sampled reference RoIs
+                # class_weights = torch.stack(sorted_tensors, dim=0)
+                # class_weights = class_weights.to(self.device)
+                # print('using sample weights, class weights shape', class_weights.shape)
 
             # sample topk classes
             class_topk = self.num_sample_class
