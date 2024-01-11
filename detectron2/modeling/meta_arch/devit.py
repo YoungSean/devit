@@ -1422,6 +1422,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 #     class_similarity.append(cur_class_similarity)
                 query_q = query_q.transpose(-2, -1)  # N x spatial x emb
                 query_v = query_v.transpose(-2, -1)  # N x spatial x emb
+
                 sorted_class_RoIs = []
                 for i in class_order:
                     cur_class_weights = class_RoIs[i]
@@ -1474,42 +1475,46 @@ class OpenSetDetectorWithExamples(nn.Module):
                 bg_dist_emb = self.fc_back_class(bg_feats)  # N x spatial x emb
                 bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
 
-            if self.use_class_weights:
+
+            # if self.use_class_weights:
                 # sample topk classes
-                class_topk = self.num_sample_class
-                class_indices = None
-                if class_topk < 0:
+            class_topk = self.num_sample_class
+            class_indices = None
+            if class_topk < 0:
+                class_topk = num_classes
+                sample_class_enabled = False
+            else:
+                if class_topk == 0:
                     class_topk = num_classes
-                    sample_class_enabled = False
+                sample_class_enabled = True
+
+            if sample_class_enabled:
+                num_active_classes = class_topk
+                init_scores = F.normalize(roi_features.flatten(2).mean(2), dim=1) @ class_weights.T
+                topk_class_indices = torch.topk(init_scores, class_topk, dim=1).indices
+
+                if self.training:
+                    class_indices = []
+                    for i in range(roi_bs):
+                        curr_label = class_labels[i].item()
+                        topk_class_indices_i = topk_class_indices[i].cpu()
+                        if curr_label in topk_class_indices_i or curr_label == num_classes:
+                            curr_indices = topk_class_indices_i
+                        else:
+                            curr_indices = torch.cat([torch.as_tensor([curr_label]),
+                                                topk_class_indices_i[:-1]])
+                        class_indices.append(curr_indices)
+                    class_indices = torch.stack(class_indices).to(self.device)
                 else:
-                    if class_topk == 0:
-                        class_topk = num_classes
-                    sample_class_enabled = True
+                    class_indices = topk_class_indices
 
-                if sample_class_enabled:
-                    num_active_classes = class_topk
-                    init_scores = F.normalize(roi_features.flatten(2).mean(2), dim=1) @ class_weights.T
-                    topk_class_indices = torch.topk(init_scores, class_topk, dim=1).indices
-
-                    if self.training:
-                        class_indices = []
-                        for i in range(roi_bs):
-                            curr_label = class_labels[i].item()
-                            topk_class_indices_i = topk_class_indices[i].cpu()
-                            if curr_label in topk_class_indices_i or curr_label == num_classes:
-                                curr_indices = topk_class_indices_i
-                            else:
-                                curr_indices = torch.cat([torch.as_tensor([curr_label]),
-                                                    topk_class_indices_i[:-1]])
-                            class_indices.append(curr_indices)
-                        class_indices = torch.stack(class_indices).to(self.device)
-                    else:
-                        class_indices = topk_class_indices
-
-                    class_indices = torch.sort(class_indices, dim=1).values
-                else:
-                    num_active_classes = num_classes
-
+                class_indices = torch.sort(class_indices, dim=1).values
+            else:
+                num_active_classes = num_classes
+            # print("class_indices.shape", class_indices.shape)
+            # print("class_indices", class_indices[0])
+            # sys.exit()
+            if self.use_class_weights:
                 other_classes = []
                 if sample_class_enabled:
                     indexes = torch.arange(0, num_classes, device=self.device)[None, None, :].repeat(bs, spatial_size, 1)
@@ -1574,6 +1579,9 @@ class OpenSetDetectorWithExamples(nn.Module):
             bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
             bg_logits = self.bg_cnn(torch.cat([bg_cls_dist_emb, bg_dist_emb], dim=1))
 
+            # only pick topk classes logits
+            cls_logits = cls_logits[torch.arange(cls_logits.size(0))[:, None], class_indices]
+
             # print("len(cls_logits)", len(cls_logits))
             # print('cls_logits[0].shape', cls_logits[0].shape)
             # print('bg_logits', bg_logits[0].shape)
@@ -1621,6 +1629,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 storage = get_event_storage()
                 storage.put_scalar("roi_cover_ratio", covered_flag.sum().item() / covered_flag.numel())
             else:
+                sample_class_enabled = True
                 reg_bs = len(rois)
                 aug_rois, pred_roi_mask, _, _ = augment_rois(rois[:, 1:], None, img_h=H, img_w=W, pooler_size=self.reg_roialign_size,
                             min_expansion=0.4, expand_shortest=True)
@@ -1720,9 +1729,10 @@ class OpenSetDetectorWithExamples(nn.Module):
         else:
             if self.training:
                 self.turn_off_box_training()
-        if not self.use_class_weights:
-            sample_class_enabled = False
-            num_active_classes = num_classes
+
+        # if not self.use_class_weights:
+        #     sample_class_enabled = False
+        #     num_active_classes = num_classes
             # print("num_classes: ", num_classes)
         #%% #! Loss Finalization and Post Processing
         if self.training:
