@@ -634,16 +634,16 @@ class OpenSetDetectorWithExamples(nn.Module):
                 mask_cids.append(c)
                 class_weights = torch.cat([class_weights, torch.zeros(1, class_weights.shape[-1])], dim=0)
 
-        print("prototype_label_names", prototype_label_names)
-        print("length of prototype_label_names", len(prototype_label_names))
-        print("60th prototype label name", prototype_label_names[60])
+        # print("prototype_label_names", prototype_label_names)
+        # print("length of prototype_label_names", len(prototype_label_names))
+        # print("60th prototype label name", prototype_label_names[60])
         train_class_order = [prototype_label_names.index(c) for c in seen_cids]
         test_class_order = [prototype_label_names.index(c) for c in all_cids]
 
         self.label_names = prototype_label_names
 
         assert -1 not in train_class_order and -1 not in test_class_order
-        print("class weights", class_weights.shape)
+        # print("class weights", class_weights.shape)
         self.register_buffer("train_class_weight", class_weights[torch.as_tensor(train_class_order)])
         self.register_buffer("test_class_weight", class_weights[torch.as_tensor(test_class_order)])
         self.test_class_order = test_class_order
@@ -799,8 +799,24 @@ class OpenSetDetectorWithExamples(nn.Module):
             # dim_value = 256
             # self.pre_to_qk = ResNetLikeCNN(num_blocks=3, channels=class_weights.shape[-1]).to(self.device)
             # self.pre_to_v = ResNetLikeCNN(num_blocks=3, channels=class_weights.shape[-1]).to(self.device)
-            self.to_qk = nn.Conv2d(class_weights.shape[-1], 128, kernel_size=1, bias=False)
-            self.to_v = nn.Conv2d(class_weights.shape[-1], 128, kernel_size=1, bias=False)
+            # self.to_qk = nn.Sequential(
+            # nn.Conv2d(class_weights.shape[-1], 128, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(128),
+            # nn.ReLU(),
+            # ).to(self.device)
+
+            # self.to_qk = nn.Conv2d(class_weights.shape[-1], 256, kernel_size=1, bias=True).to(self.device)
+
+            # self.to_v = nn.Sequential(
+            # nn.Conv2d(class_weights.shape[-1], 128, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(128),
+            # nn.ReLU(),
+            # ).to(self.device)
+
+            self.to_v = nn.Conv2d(class_weights.shape[-1], 256, kernel_size=1, bias=True).to(self.device)
+
+            # self.bg_to_qk = nn.Linear(class_weights.shape[-1], 128, bias=True).to(self.device)
+            # self.bg_to_v = nn.Linear(class_weights.shape[-1], 128, bias=True).to(self.device)
             # Define the model
             # self.ctx_cnn_model = ResNetLikeCNN(num_blocks=1).to(self.device)
             # self.cross_transformer = SimpleCrossTransformer(
@@ -1374,8 +1390,6 @@ class OpenSetDetectorWithExamples(nn.Module):
                         selected_RoIs = [self.test_RoIs_list[i] for i in selected_elements]
                         RoIs = torch.stack(selected_RoIs, dim=0)
                         if RoIs.shape[0] < sample_num:
-                            # RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)],
-                            #                  dim=0)
                             # Calculate repeat times and remainder
                             repeat_times = sample_num // RoIs.size(0)
                             remainder = sample_num % RoIs.size(0)
@@ -1388,15 +1402,31 @@ class OpenSetDetectorWithExamples(nn.Module):
                                 RoIs = torch.cat((padded_tensor, extra_part), dim=0)
                         class_RoIs[label] = RoIs
 
-                # # use crossTransformers to get similarity matrix
-                # print("shape of original_roi_features", original_roi_features.shape)
-                # query_q, query_v = self.to_qk(self.pre_to_qk(original_roi_features)).flatten(2), self.to_v(self.pre_to_v(original_roi_features)).flatten(2)
-                query_q, query_v = self.to_qk(original_roi_features).flatten(2), self.to_v(original_roi_features).flatten(2)
 
                 class_order = range(num_classes)
                 if use_novel_sample:
                     class_order = self.coco_test_class_order
 
+                # pick top k samples from all sample RoIs, do not care the class
+                all_sample_mean_RoIs = []
+                all_sample_RoIs = []
+                for i in class_order:
+                    cur_sample_weights = class_RoIs[i].flatten(2).to(roi_features)  # sample num X C X spatial
+                    cur_mean = cur_sample_weights.mean(2)
+                    print('cur_sample_weights shape', cur_sample_weights.shape)
+                    print('cur_mean shape', cur_mean.shape)
+                    all_sample_RoIs = all_sample_RoIs.append(cur_sample_weights)
+                    all_sample_mean_RoIs.append(cur_mean)
+                all_sample_RoIs = torch.stack(all_sample_RoIs, dim=0).to(roi_features)  # (class x sample_num) x C x spatial
+                all_sample_mean_RoIs = torch.stack(all_sample_mean_RoIs, dim=0).to(roi_features) # (class x sample_num) x C
+                print('all_sample_RoIs shape', all_sample_RoIs.shape)
+                print('all_sample_mean_RoIs shape', all_sample_mean_RoIs.shape)
+
+                sys.exit()
+                # to find the top k reference RoIs
+                # topk_sample = True
+                # tok_sample_num = 5
+                # if topk_sample:
 
                 # sorted_tensors = []
                 # for i in class_order:
@@ -1420,24 +1450,45 @@ class OpenSetDetectorWithExamples(nn.Module):
                 #     result = self.cross_attn(query_feature, class_feats, class_feats)
                 #     cur_class_similarity = - torch.mean((result - query_feature) ** 2, dim=-1)
                 #     class_similarity.append(cur_class_similarity)
+
+                # # use crossTransformers to get similarity matrix
+                # print("shape of original_roi_features", original_roi_features.shape)
+                # query_q, query_v = self.to_qk(self.pre_to_qk(original_roi_features)).flatten(2), self.to_v(self.pre_to_v(original_roi_features)).flatten(2)
+                # query_q, query_v = self.to_qk(original_roi_features).flatten(2), self.to_v(original_roi_features).flatten(2)
+
+                query_q = original_roi_features.flatten(2)
+                query_v = self.to_v(original_roi_features).flatten(2)
                 query_q = query_q.transpose(-2, -1)  # N x spatial x emb
                 query_v = query_v.transpose(-2, -1)  # N x spatial x emb
 
-                sorted_class_RoIs = []
-                for i in class_order:
-                    cur_class_weights = class_RoIs[i]
-                    sorted_class_RoIs.append(cur_class_weights)
-                class_RoIs = torch.stack(sorted_class_RoIs, dim=0).to(roi_features)  # class x sample_num x C x K x K
-                class_RoIs = class_RoIs.reshape(-1, *class_RoIs.shape[2:])  # (class*sample_num) x C x K x K
-                # class_supports_k, class_supports_v = self.to_qk(self.pre_to_qk(class_RoIs)), self.to_v(self.pre_to_v(class_RoIs))
-                class_supports_k, class_supports_v = self.to_qk(class_RoIs), self.to_v(class_RoIs)
-                class_supports_k = class_supports_k.reshape(num_classes, -1, *class_supports_k.shape[1:])  # class x sample_num x C x K x K
-                class_supports_v = class_supports_v.reshape(num_classes, -1, *class_supports_v.shape[1:])  # class x sample_num x C x K x K
+                # sorted_class_RoIs = []
+                # class_supports_k = []
+                # class_supports_v = []
+                # for i in class_order:
+                #     cur_class_weights = class_RoIs[i].to(roi_features)
+                #     sorted_class_RoIs.append(cur_class_weights)
+                #     cur_class_supports_k, cur_class_supports_v = self.to_qk(cur_class_weights), self.to_v(cur_class_weights)
+                #     # print('cur_class_supports_k shape', cur_class_supports_k.shape)
+                #     class_supports_k.append(cur_class_supports_k)
+                #     class_supports_v.append(cur_class_supports_v)
+                # class_supports_k = torch.stack(class_supports_k, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # # print('class_supports_k shape', class_supports_k.shape)
+                # class_supports_v = torch.stack(class_supports_v, dim=0).to(roi_features)  # class x sample_num x C x K x K
+
+                # class_RoIs = torch.stack(sorted_class_RoIs, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # class_RoIs = class_RoIs.reshape(-1, *class_RoIs.shape[2:])  # (class*sample_num) x C x K x K
+                # # class_supports_k, class_supports_v = self.to_qk(self.pre_to_qk(class_RoIs)), self.to_v(self.pre_to_v(class_RoIs))
+                # class_supports_k, class_supports_v = self.to_qk(class_RoIs), self.to_v(class_RoIs)
+                # class_supports_k = class_supports_k.reshape(num_classes, -1, *class_supports_k.shape[1:])  # class x sample_num x C x K x K
+                # class_supports_v = class_supports_v.reshape(num_classes, -1, *class_supports_v.shape[1:])  # class x sample_num x C x K x K
+
 
                 for i in class_order:
-                    # cur_class_weights = class_RoIs[i].to(roi_features)
-                    # supports_k, supports_v = self.to_qk(cur_class_weights), self.to_v(cur_class_weights)
-                    supports_k, supports_v = class_supports_k[i], class_supports_v[i]
+                    cur_class_weights = class_RoIs[i].to(roi_features)
+                    # supports_k, supports_v = self.to_qk(cur_class_weights), self.to_v(
+                    #     cur_class_weights)
+                    supports_k = cur_class_weights
+                    supports_v = self.to_v(cur_class_weights)
                     supports_k = supports_k.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
                     emb_size = supports_k.shape[-1]
                     spatial_size = supports_k.shape[1]
@@ -1458,6 +1509,20 @@ class OpenSetDetectorWithExamples(nn.Module):
                     class_similarity.append(cur_class_similarity)
 
                 cls_logits = torch.stack(class_similarity, dim=1)  # N x num_classes. e.g. 1000 x 34. 34 is the number of classes
+
+                # get bg logits for topk classes in CTX way
+                # bg_key = self.bg_to_qk(self.bg_tokens)
+                # bg_value = self.bg_to_v(self.bg_tokens)
+                #
+                # bg_key = bg_key.repeat(bs, 1, 1)  # N x class x emb
+                # bg_value = bg_value.repeat(bs, 1, 1)
+                # # query_feature = query_q.transpose(-2, -1)  # N x spatial x emb
+                # bg_result = scaled_dot_product_attention(query_q, bg_key, bg_value)
+                # # result = self.cross_attn(query_feature, class_feats, class_feats)
+                # bg_logits = - ((bg_result.flatten(1) - query_v.flatten(1)) ** 2).sum(dim=-1) / spatial_size  # bs
+                # bg_logits = bg_logits[:, None] # bs, 1
+
+                # print('bg_logits shape', bg_logits.shape)
                 # feats = class_similarity
                 # print('class similarity shape', class_similarity.shape)
                 # cls_logits = class_similarity.mean(dim=1) # N x num_classes
@@ -1471,6 +1536,8 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # class_weights = torch.stack(sorted_tensors, dim=0)
                 # class_weights = class_weights.to(self.device)
                 # print('using sample weights, class weights shape', class_weights.shape)
+
+                # get bg feats
                 bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T  # N x spatial x back
                 bg_dist_emb = self.fc_back_class(bg_feats)  # N x spatial x emb
                 bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
@@ -1574,6 +1641,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
             # N x 1
             # feats: N x spatial x class
+            # if self.use_class_weights:
             cls_dist_feats = interpolate(torch.sort(feats, dim=2).values, self.T, mode='linear') # N x spatial x T
             bg_cls_dist_emb = self.fc_bg_class(cls_dist_feats) # N x spatial x emb
             bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
@@ -1582,9 +1650,13 @@ class OpenSetDetectorWithExamples(nn.Module):
             # only pick topk classes logits
             cls_logits = cls_logits[torch.arange(cls_logits.size(0))[:, None], class_indices]
 
+
+            # print("sample_class_enabled", sample_class_enabled)
+            # print("num of active classes", num_active_classes)
             # print("len(cls_logits)", len(cls_logits))
-            # print('cls_logits[0].shape', cls_logits[0].shape)
-            # print('bg_logits', bg_logits[0].shape)
+            # print('cls_logit.shape', cls_logits.shape)
+            # print('bg_logits', bg_logits.shape)
+
 
 
             if isinstance(bg_logits, list):
@@ -1594,7 +1666,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                         logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
                 else:
                     for b in bg_logits:
-                        logits.append(torch.cat([cls_logits, b], dim=1))
+                        logits.append(torch.cat([cls_logits, b], dim=1) / self.cls_temp)
 
             else:
                 # N x (classes + 1)
@@ -1604,6 +1676,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             # print('logits[0].shape', logits[0].shape)
             # print('class label', class_labels.shape)
             # print('class label', class_labels)
+            # print('logits.shape', logits.shape)
             # sys.exit()
             # print('logits.shape', logits.shape)
         else:
@@ -1629,7 +1702,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 storage = get_event_storage()
                 storage.put_scalar("roi_cover_ratio", covered_flag.sum().item() / covered_flag.numel())
             else:
-                sample_class_enabled = True
+                # sample_class_enabled = True
                 reg_bs = len(rois)
                 aug_rois, pred_roi_mask, _, _ = augment_rois(rois[:, 1:], None, img_h=H, img_w=W, pooler_size=self.reg_roialign_size,
                             min_expansion=0.4, expand_shortest=True)
@@ -1730,10 +1803,6 @@ class OpenSetDetectorWithExamples(nn.Module):
             if self.training:
                 self.turn_off_box_training()
 
-        # if not self.use_class_weights:
-        #     sample_class_enabled = False
-        #     num_active_classes = num_classes
-            # print("num_classes: ", num_classes)
         #%% #! Loss Finalization and Post Processing
         if self.training:
             class_labels = class_labels.long()
