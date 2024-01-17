@@ -1334,7 +1334,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
             # if self.use_class_weights:
             # (N x spatial x emb) @ (emb x class) = N x spatial x class
-            feats = roi_features.transpose(-2, -1) @ class_weights.T
+            # feats = roi_features.transpose(-2, -1) @ class_weights.T
             if not self.use_class_weights:
                 # get the sample RoI feature maps
                 class_RoIs = {}
@@ -1411,22 +1411,31 @@ class OpenSetDetectorWithExamples(nn.Module):
                 all_sample_mean_RoIs = []
                 all_sample_RoIs = []
                 for i in class_order:
-                    cur_sample_weights = class_RoIs[i].flatten(2).to(roi_features)  # sample num X C X spatial
-                    cur_mean = cur_sample_weights.mean(2)
-                    print('cur_sample_weights shape', cur_sample_weights.shape)
-                    print('cur_mean shape', cur_mean.shape)
-                    all_sample_RoIs = all_sample_RoIs.append(cur_sample_weights)
+                    cur_sample_weights = class_RoIs[i].flatten(2).to(roi_features)  # sample num X C X spatial e.g. 16 x 768 x 49
+                    cur_mean = cur_sample_weights.mean(2) # sample num X C e.g. 16 x 768
+                    all_sample_RoIs.append(cur_sample_weights)
                     all_sample_mean_RoIs.append(cur_mean)
-                all_sample_RoIs = torch.stack(all_sample_RoIs, dim=0).to(roi_features)  # (class x sample_num) x C x spatial
-                all_sample_mean_RoIs = torch.stack(all_sample_mean_RoIs, dim=0).to(roi_features) # (class x sample_num) x C
-                print('all_sample_RoIs shape', all_sample_RoIs.shape)
-                print('all_sample_mean_RoIs shape', all_sample_mean_RoIs.shape)
+                all_sample_RoIs = torch.cat(all_sample_RoIs, dim=0).to(roi_features)  # (class x sample_num) x C x spatial, e.g. 960 x 768 x 49
+                all_sample_mean_RoIs = torch.cat(all_sample_mean_RoIs, dim=0).to(roi_features) # (class x sample_num) x C , e.g. 960 x 768
 
-                sys.exit()
                 # to find the top k reference RoIs
-                # topk_sample = True
-                # tok_sample_num = 5
-                # if topk_sample:
+                topk_sample = True
+                tok_sample_num = 16
+                if topk_sample:
+                    init_sample_scores = F.normalize(roi_features.flatten(2).mean(2), dim=1) @ all_sample_mean_RoIs.T  # N x (class x sample_num) e.g.256x960
+                    topk_sample_indices = torch.topk(init_sample_scores, tok_sample_num, dim=1).indices # N x tok_sample_num
+                    topk_sample_indices = torch.sort(topk_sample_indices, dim=1).values
+                    topk_sample = all_sample_RoIs[topk_sample_indices] # N x tok_sample_num x C x spatial
+                    topk_sample = topk_sample.transpose(-2, -1) # N x tok_sample_num x spatial x C
+                    emb_size = topk_sample.shape[-1]
+                    topk_sample = topk_sample.reshape(bs, -1, emb_size)# N x (tok_sample_num x spatial) x emb
+                    # then we use these topk_sample to update the RoI features
+                    query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                    updated_roi_features = scaled_dot_product_attention(query_feature, topk_sample, topk_sample)
+                    feats = updated_roi_features @ class_weights.T
+                else:
+                    feats = roi_features.transpose(-2, -1) @ class_weights.T
+
 
                 # sorted_tensors = []
                 # for i in class_order:
@@ -1436,7 +1445,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # img_supports = img_supports[None, :, :, :, :, :]
                 # img_query = original_roi_features # batch, C, K, K
                 # feats = self.cross_transformer(self.ctx_cnn_model, img_query, img_supports)
-                class_similarity = []
+                # class_similarity = []
                 # for i in class_order:
                 #     cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
                 #     class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
@@ -1455,11 +1464,12 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # print("shape of original_roi_features", original_roi_features.shape)
                 # query_q, query_v = self.to_qk(self.pre_to_qk(original_roi_features)).flatten(2), self.to_v(self.pre_to_v(original_roi_features)).flatten(2)
                 # query_q, query_v = self.to_qk(original_roi_features).flatten(2), self.to_v(original_roi_features).flatten(2)
-
-                query_q = original_roi_features.flatten(2)
-                query_v = self.to_v(original_roi_features).flatten(2)
-                query_q = query_q.transpose(-2, -1)  # N x spatial x emb
-                query_v = query_v.transpose(-2, -1)  # N x spatial x emb
+                use_CTX_cls_logit = False
+                if use_CTX_cls_logit:
+                    query_q = original_roi_features.flatten(2)
+                    query_v = self.to_v(original_roi_features).flatten(2)
+                    query_q = query_q.transpose(-2, -1)  # N x spatial x emb
+                    query_v = query_v.transpose(-2, -1)  # N x spatial x emb
 
                 # sorted_class_RoIs = []
                 # class_supports_k = []
@@ -1482,33 +1492,37 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # class_supports_k = class_supports_k.reshape(num_classes, -1, *class_supports_k.shape[1:])  # class x sample_num x C x K x K
                 # class_supports_v = class_supports_v.reshape(num_classes, -1, *class_supports_v.shape[1:])  # class x sample_num x C x K x K
 
+                    class_similarity = []
+                    for i in class_order:
+                        cur_class_weights = class_RoIs[i].to(roi_features)
+                        # supports_k, supports_v = self.to_qk(cur_class_weights), self.to_v(
+                        #     cur_class_weights)
+                        supports_k = cur_class_weights
+                        supports_v = self.to_v(cur_class_weights)
+                        supports_k = supports_k.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
+                        emb_size = supports_k.shape[-1]
+                        spatial_size = supports_k.shape[1]
+                        supports_v = supports_v.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
+                        supports_k = supports_k.reshape(-1, emb_size) # (sample_num*spatial) x emb
+                        supports_v = supports_v.reshape(-1, emb_size) # (sample_num*spatial) x emb
+                        # print('query_q shape', query_q.shape)
+                        # print('supports_k shape', supports_k.shape)
+                        supports_k = supports_k.repeat(bs, 1, 1)
+                        # print('after repeat supports_k shape', supports_k.shape)
+                        supports_v = supports_v.repeat(bs, 1, 1)
+                        # query_feature = query_q.transpose(-2, -1)  # N x spatial x emb
+                        result = scaled_dot_product_attention(query_q, supports_k, supports_v)
+                        # result = self.cross_attn(query_feature, class_feats, class_feats)
+                        cur_class_similarity = - ((result.flatten(1) - query_v.flatten(1)) ** 2).sum(dim = -1) / spatial_size  # bs, 1
+                        # cur_class_similarity = F.softmax(cur_class_similarity, dim=-1) # bs, spatial
+                        # print('cur_class_similarity shape', cur_class_similarity.shape)
+                        class_similarity.append(cur_class_similarity)
 
-                for i in class_order:
-                    cur_class_weights = class_RoIs[i].to(roi_features)
-                    # supports_k, supports_v = self.to_qk(cur_class_weights), self.to_v(
-                    #     cur_class_weights)
-                    supports_k = cur_class_weights
-                    supports_v = self.to_v(cur_class_weights)
-                    supports_k = supports_k.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
-                    emb_size = supports_k.shape[-1]
-                    spatial_size = supports_k.shape[1]
-                    supports_v = supports_v.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
-                    supports_k = supports_k.reshape(-1, emb_size) # (sample_num*spatial) x emb
-                    supports_v = supports_v.reshape(-1, emb_size) # (sample_num*spatial) x emb
-                    # print('query_q shape', query_q.shape)
-                    # print('supports_k shape', supports_k.shape)
-                    supports_k = supports_k.repeat(bs, 1, 1)
-                    # print('after repeat supports_k shape', supports_k.shape)
-                    supports_v = supports_v.repeat(bs, 1, 1)
-                    # query_feature = query_q.transpose(-2, -1)  # N x spatial x emb
-                    result = scaled_dot_product_attention(query_q, supports_k, supports_v)
-                    # result = self.cross_attn(query_feature, class_feats, class_feats)
-                    cur_class_similarity = - ((result.flatten(1) - query_v.flatten(1)) ** 2).sum(dim = -1) / spatial_size  # bs, 1
-                    # cur_class_similarity = F.softmax(cur_class_similarity, dim=-1) # bs, spatial
-                    # print('cur_class_similarity shape', cur_class_similarity.shape)
-                    class_similarity.append(cur_class_similarity)
-
-                cls_logits = torch.stack(class_similarity, dim=1)  # N x num_classes. e.g. 1000 x 34. 34 is the number of classes
+                    cls_logits = torch.stack(class_similarity, dim=1)  # N x num_classes. e.g. 1000 x 34. 34 is the number of classes
+                    # get bg feats
+                    bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T  # N x spatial x back
+                    bg_dist_emb = self.fc_back_class(bg_feats)  # N x spatial x emb
+                    bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
 
                 # get bg logits for topk classes in CTX way
                 # bg_key = self.bg_to_qk(self.bg_tokens)
@@ -1537,14 +1551,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # class_weights = class_weights.to(self.device)
                 # print('using sample weights, class weights shape', class_weights.shape)
 
-                # get bg feats
-                bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T  # N x spatial x back
-                bg_dist_emb = self.fc_back_class(bg_feats)  # N x spatial x emb
-                bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
 
-
-            # if self.use_class_weights:
-                # sample topk classes
             class_topk = self.num_sample_class
             class_indices = None
             if class_topk < 0:
@@ -1581,7 +1588,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             # print("class_indices.shape", class_indices.shape)
             # print("class_indices", class_indices[0])
             # sys.exit()
-            if self.use_class_weights:
+            if not use_CTX_cls_logit:
                 other_classes = []
                 if sample_class_enabled:
                     indexes = torch.arange(0, num_classes, device=self.device)[None, None, :].repeat(bs, spatial_size, 1)
@@ -1632,12 +1639,12 @@ class OpenSetDetectorWithExamples(nn.Module):
 
                 # N x classes
                 if isinstance(cls_logits, list):
-                    for v in cls_logits:
-                        print('v.shape', v.shape)
+                    # for v in cls_logits:
+                        # print('v.shape', v.shape)
                     cls_logits = [v.reshape(bs, num_active_classes) for v in cls_logits]
                 else:
                     cls_logits = cls_logits.reshape(bs, num_active_classes)
-                print('num_active_classes', num_active_classes)
+                # print('num_active_classes', num_active_classes)
 
             # N x 1
             # feats: N x spatial x class
@@ -1647,38 +1654,26 @@ class OpenSetDetectorWithExamples(nn.Module):
             bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
             bg_logits = self.bg_cnn(torch.cat([bg_cls_dist_emb, bg_dist_emb], dim=1))
 
-            # only pick topk classes logits
-            cls_logits = cls_logits[torch.arange(cls_logits.size(0))[:, None], class_indices]
-
-
-            # print("sample_class_enabled", sample_class_enabled)
-            # print("num of active classes", num_active_classes)
-            # print("len(cls_logits)", len(cls_logits))
-            # print('cls_logit.shape', cls_logits.shape)
-            # print('bg_logits', bg_logits.shape)
-
+            if use_CTX_cls_logit:
+                # only pick topk classes logits
+                cls_logits = cls_logits[torch.arange(cls_logits.size(0))[:, None], class_indices]
 
 
             if isinstance(bg_logits, list):
                 logits = []
-                if self.use_class_weights:
-                    for c,b in zip(cls_logits, bg_logits):
-                        logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
-                else:
-                    for b in bg_logits:
-                        logits.append(torch.cat([cls_logits, b], dim=1) / self.cls_temp)
+                for c, b in zip(cls_logits, bg_logits):
+                    logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
+                # if self.use_class_weights:
+                #     for c,b in zip(cls_logits, bg_logits):
+                #         logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
+                # else:
+                #     for b in bg_logits:
+                #         logits.append(torch.cat([cls_logits, b], dim=1) / self.cls_temp)
 
             else:
                 # N x (classes + 1)
                 logits = torch.cat([cls_logits, bg_logits], dim=1)
                 logits = logits / self.cls_temp
-            # print('len(logits)', len(logits))
-            # print('logits[0].shape', logits[0].shape)
-            # print('class label', class_labels.shape)
-            # print('class label', class_labels)
-            # print('logits.shape', logits.shape)
-            # sys.exit()
-            # print('logits.shape', logits.shape)
         else:
             if self.training:
                 self.turn_off_cls_training()
