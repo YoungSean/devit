@@ -2,11 +2,13 @@
 import math
 import random
 import logging
+import sys
+
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from numpy.lib import pad
 import torch
-from torch import nn
+from torch import nn, einsum
 from torch.nn import functional as F
 from random import randint
 from torch.cuda.amp import autocast
@@ -27,7 +29,7 @@ from detectron2.data.datasets.coco_zeroshot_categories import COCO_SEEN_CLS, \
 from ..roi_heads import build_roi_heads
 from ..matcher import Matcher
 from .build import META_ARCH_REGISTRY
-
+from collections import defaultdict
 
 from PIL import Image
 import copy
@@ -49,6 +51,141 @@ from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+# from cross_transformers_pytorch import CrossTransformer
+from einops import rearrange
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        # Assuming kernel_size=3, stride=1, and padding=1 to maintain the spatial dimensions
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity  # Adding the input (identity) to the output
+        out = F.relu(out)
+        return out
+
+class ResNetLikeCNN(nn.Module):
+    def __init__(self, num_blocks, channels=768):
+        super(ResNetLikeCNN, self).__init__()
+        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
+
+    def forward(self, x):
+        return self.blocks(x)
+
+random.seed(10)
+
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    # Efficient implementation equivalent to the following:
+    # copy from pytorch: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
+class CrossAttention(nn.Module):
+    def __init__(self, embed_size):
+        super(CrossAttention, self).__init__()
+        self.query_linear = nn.Linear(embed_size, embed_size)
+        self.key_linear = nn.Linear(embed_size, embed_size)
+        self.value_linear = nn.Linear(embed_size, embed_size)
+
+    def forward(self, query, key, value, mask=None):
+        # Apply linear transformations
+        query_transformed = self.query_linear(query)
+        key_transformed = self.key_linear(key)
+        value_transformed = self.value_linear(value)
+
+        # Scaled dot-product attention
+        output = scaled_dot_product_attention(query_transformed, key_transformed, value_transformed, attn_mask=mask)
+
+        return output
+
+
+class SimpleCrossTransformer(nn.Module):
+    def __init__(
+            self,
+            dim=512,
+            dim_key=128,
+            dim_value=128
+    ):
+        super().__init__()
+        self.scale = dim_key ** -0.5
+        self.to_qk = nn.Conv2d(dim, dim_key, kernel_size=1, bias=False)
+        self.to_v = nn.Conv2d(dim, dim_value, kernel_size=1, bias=False)
+
+    def forward(self, model, img_query, img_supports):
+        """
+        dimensions names:
+
+        b - batch
+        k - num classes
+        n - num images in a support class
+        c - channels
+        h, i - height
+        w, j - width
+        """
+
+        b, k, *_ = img_supports.shape
+        img_supports = rearrange(img_supports, 'b k n c h w -> (b k n) c h w', b=b)  # b set to 1
+        if model:
+            query_repr = model(img_query)
+            supports_repr = model(img_supports)
+        else:
+            query_repr = img_query
+            supports_repr = img_supports
+        bs, _, h, w = query_repr.shape
+
+        query_q, query_v = self.to_qk(query_repr), self.to_v(query_repr)
+
+        supports_k, supports_v = self.to_qk(supports_repr), self.to_v(supports_repr)
+        # # use attention
+        # query_q = rearrange(query_q, 'b c h w -> b (h w) c')
+        # query_v = rearrange(query_v, 'b c h w -> b (h w) c')
+        # supports_k = rearrange(supports_k, 'b c h w -> b (h w) c').repeat(bs, 1, 1)
+        # supports_v = rearrange(supports_v, 'b c h w -> b (h w) c').repeat(bs, 1, 1)
+        #
+        # out = scaled_dot_product_attention(query_q, supports_k, supports_v)
+
+        supports_k, supports_v = map(lambda t: rearrange(t, '(b k n) c h w -> b k n c h w', b=b, k=k),
+                                     (supports_k, supports_v))
+
+        supports_k = supports_k.repeat(bs, 1, 1, 1, 1, 1)
+        supports_v = supports_v.repeat(bs, 1, 1, 1, 1, 1)
+        sim = einsum('b c h w, b k n c i j -> b k h w n i j', query_q, supports_k) * self.scale
+        sim = rearrange(sim, 'b k h w n i j -> b k h w (n i j)')
+
+        attn = sim.softmax(dim=-1)
+        attn = rearrange(attn, 'b k h w (n i j) -> b k h w n i j', i=h, j=w)
+
+        out = einsum('b k h w n i j, b k n c i j -> b k c h w', attn, supports_v)
+
+        out = rearrange(out, 'b k c h w -> b k (c h w)')
+        query_v = rearrange(query_v, 'b c h w -> b () (c h w)')
+        #
+        euclidean_dist = ((query_v - out) ** 2).sum(dim=-1) / (h * w)
+        return -euclidean_dist
 
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
@@ -226,6 +363,8 @@ def _log_classification_stats(pred_logits, gt_classes):
         pass
 
 
+# Create the CrossEntropyLoss instance with no reduction
+# ce_criterion = nn.CrossEntropyLoss(reduction='none')
 def focal_loss(inputs, targets, gamma=0.5, reduction="mean", bg_weight=0.2, num_classes=None):
     """Inspired by RetinaNet implementation"""
     if targets.numel() == 0 and reduction == "mean":
@@ -233,6 +372,7 @@ def focal_loss(inputs, targets, gamma=0.5, reduction="mean", bg_weight=0.2, num_
     
     # focal scaling
     ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+    # ce_loss = ce_criterion(inputs, targets) # use CrossEntropyLoss to get stable loss value
     p = F.softmax(inputs, dim=-1)
     p_t = p[torch.arange(p.size(0)).to(p.device), targets]  # get prob of target class
     p_t = torch.clamp(p_t, 1e-7, 1-1e-7) # prevent NaN
@@ -375,7 +515,7 @@ class OpenSetDetectorWithExamples(nn.Module):
     def __init__(self,
                 offline_backbone: Backbone,
                 backbone: Backbone,
-                offline_proposal_generator: nn.Module, 
+                offline_proposal_generator: nn.Module,
 
                 pixel_mean: Tuple[float],
                 pixel_std: Tuple[float],
@@ -396,13 +536,13 @@ class OpenSetDetectorWithExamples(nn.Module):
                 test_nms_thresh=0.5,
                 test_topk_per_image=100,
                 cls_temp=0.1,
-                
+
                 num_sample_class=-1,
                 seen_cids = [],
                 all_cids = [],
                 mask_cids = [],
                 T_length=128,
-                
+
                 bg_cls_weight=0.2,
                 batch_size_per_image=128,
                 pos_ratio=0.25,
@@ -428,10 +568,10 @@ class OpenSetDetectorWithExamples(nn.Module):
         else:
             self.div_pixel = False
 
-        # RPN related 
+        # RPN related
         self.input_format = "RGB"
         self.offline_backbone = offline_backbone
-        self.offline_proposal_generator = offline_proposal_generator        
+        self.offline_proposal_generator = offline_proposal_generator
         if offline_input_format and offline_pixel_mean and offline_pixel_std:
             self.offline_input_format = offline_input_format
             self.register_buffer("offline_pixel_mean", torch.tensor(offline_pixel_mean).view(-1, 1, 1), False)
@@ -441,11 +581,12 @@ class OpenSetDetectorWithExamples(nn.Module):
                 self.offline_div_pixel = True
             else:
                 self.offline_div_pixel = False
-        
+
         self.proposal_matcher = proposal_matcher
-        
+
         # class_prototypes_file
         #  prototypes, class_order_for_inference
+        print("class_prototypes_file", class_prototypes_file)
         if isinstance(class_prototypes_file, str):
             dct = torch.load(class_prototypes_file)
             prototypes = dct['prototypes']
@@ -468,7 +609,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 self.oneshot_prototypes = oneshot_prototypes
 
                 oneshot_prototypes = oneshot_prototypes[
-                    torch.arange(oneshot_num_classes), 
+                    torch.arange(oneshot_num_classes),
                     torch.randint(0, oneshot_sample_pool, (oneshot_num_classes,))]
 
                 prototypes = torch.cat([p1['prototypes'], oneshot_prototypes], dim=0)
@@ -483,7 +624,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             class_weights = F.normalize(prototypes.mean(dim=1), dim=-1)
         else:
             class_weights = F.normalize(prototypes, dim=-1)
-        
+
         self.num_train_classes = len(seen_cids)
         self.num_classes = len(all_cids)
 
@@ -492,18 +633,26 @@ class OpenSetDetectorWithExamples(nn.Module):
                 prototype_label_names.append(c)
                 mask_cids.append(c)
                 class_weights = torch.cat([class_weights, torch.zeros(1, class_weights.shape[-1])], dim=0)
-        
+
+        # print("prototype_label_names", prototype_label_names)
+        # print("length of prototype_label_names", len(prototype_label_names))
+        # print("60th prototype label name", prototype_label_names[60])
         train_class_order = [prototype_label_names.index(c) for c in seen_cids]
         test_class_order = [prototype_label_names.index(c) for c in all_cids]
 
         self.label_names = prototype_label_names
 
         assert -1 not in train_class_order and -1 not in test_class_order
-
+        # print("class weights", class_weights.shape)
         self.register_buffer("train_class_weight", class_weights[torch.as_tensor(train_class_order)])
         self.register_buffer("test_class_weight", class_weights[torch.as_tensor(test_class_order)])
         self.test_class_order = test_class_order
+        # print("train_class_weight", self.train_class_weight.shape)
+        # print("test_class_weight", self.test_class_weight.shape)
+        # print("train_class_order", train_class_order)
+        # print("test_class_order", test_class_order)
 
+        self.coco_test_class_order = test_class_order
         self.all_labels = all_cids
         self.seen_labels = seen_cids
 
@@ -537,7 +686,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         self.Temb = 128
         self.Tbg_emb = 128
         hidden_dim = 256
-        # N x C x 14 x 14 -> N x 1 
+        # N x C x 14 x 14 -> N x 1
         self.ce = nn.CrossEntropyLoss()
         self.fc_intra_class = nn.Linear(self.Tpos_emb, self.Temb)
         self.fc_other_class = nn.Linear(self.T, self.Temb)
@@ -545,7 +694,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         cls_input_dim = self.Temb * 2 + self.Tbg_emb
         bg_input_dim = self.Temb + self.Tbg_emb
-        
+
         self.per_cls_cnn = PropagateNet(cls_input_dim, hidden_dim, num_layers=num_cls_layers)
         self.bg_cnn = PropagateNet(bg_input_dim, hidden_dim, num_layers=num_cls_layers)
 
@@ -589,7 +738,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             nn.ReLU(),
         )
         self.rp4_out = nn.Conv2d(hidden_dim, 1, kernel_size=3, stride=1, padding=1)
-        
+
         self.rp5 = nn.Sequential(
             nn.Conv2d(reg_feat_dim + 5, hidden_dim, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(hidden_dim),
@@ -615,8 +764,68 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         if use_one_shot:
             self.one_shot_ref = torch.load(one_shot_reference)
-        
-        # ---------- mask related layers --------- # 
+
+        self.use_class_weights = False
+        if self.use_class_weights:
+            print("Only using class weights / prototypes for classification")
+            self.train_RoIs_list = None
+            self.train_label_idx = None
+            self.test_RoIs_list = None
+            self.test_label_idx = None
+            self.cross_attn = None
+        else:
+            # uses RoI to generate similarity matrix
+            # cur_patchs = "fs_coco_trainval_base.vitb14_10000_samples.bbox.pkl"
+            cur_patchs = "fs_coco_trainval_base.vitb14_98459_samples.bbox.pkl"
+            coco60 = torch.load(cur_patchs)
+            labels = coco60['labels']
+            self.train_RoIs_list = coco60['RoI_feature_tokens']
+            self.train_label_idx = defaultdict(list)
+            for idx, label in enumerate(labels):
+                self.train_label_idx[label].append(idx)
+
+            #test_cur_patchs = "fs_coco_test_all.vitb14_4954_samples.bbox.pkl"
+            test_cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples_label60_79.bbox.pkl"
+            test_coco = torch.load(test_cur_patchs)
+            test_labels = test_coco['labels']
+            self.test_RoIs_list = test_coco['RoI_feature_tokens']
+            self.test_label_idx = defaultdict(list)
+            for idx, label in enumerate(test_labels):
+                self.test_label_idx[label].append(idx)
+
+            # self.cross_attn = CrossAttention(class_weights.shape[-1])
+            # dim = class_weights.shape[-1]
+            # dim_key = 256
+            # dim_value = 256
+            # self.pre_to_qk = ResNetLikeCNN(num_blocks=3, channels=class_weights.shape[-1]).to(self.device)
+            # self.pre_to_v = ResNetLikeCNN(num_blocks=3, channels=class_weights.shape[-1]).to(self.device)
+            # self.to_qk = nn.Sequential(
+            # nn.Conv2d(class_weights.shape[-1], 128, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(128),
+            # nn.ReLU(),
+            # ).to(self.device)
+
+            # self.to_qk = nn.Conv2d(class_weights.shape[-1], 256, kernel_size=1, bias=True).to(self.device)
+
+            # self.to_v = nn.Sequential(
+            # nn.Conv2d(class_weights.shape[-1], 128, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(128),
+            # nn.ReLU(),
+            # ).to(self.device)
+
+            self.to_v = nn.Conv2d(class_weights.shape[-1], 256, kernel_size=1, bias=True).to(self.device)
+
+            # self.bg_to_qk = nn.Linear(class_weights.shape[-1], 128, bias=True).to(self.device)
+            # self.bg_to_v = nn.Linear(class_weights.shape[-1], 128, bias=True).to(self.device)
+            # Define the model
+            # self.ctx_cnn_model = ResNetLikeCNN(num_blocks=1).to(self.device)
+            # self.cross_transformer = SimpleCrossTransformer(
+            #         dim = class_weights.shape[-1],
+            #         dim_key = 128,
+            #         dim_value = 128
+            #     ).to(self.device)
+
+        # ---------- mask related layers --------- #
         self.only_train_mask = only_train_mask if use_mask else False
         self.use_mask = use_mask
 
@@ -649,20 +858,20 @@ class OpenSetDetectorWithExamples(nn.Module):
                     feat_inp_dim = feat_inp_dim * 3
                 else:
                     self.mask_feat_compress = nn.Conv2d(self.train_class_weight.shape[-1], feat_inp_dim, 1, 1, 0)
-            
+
             if self.use_init_mask:
-                self.fc_init_mask = nn.Conv2d(1, 1, 1, 1, 0)   
+                self.fc_init_mask = nn.Conv2d(1, 1, 1, 1, 0)
                 self.fc_init_mask.weight.data.fill_(1.0)
                 self.fc_init_mask.bias.data.fill_(0.0)
-            
+
             if self.use_mask_dropout:
                 self.mask_dropout = nn.Dropout2d(p=0.5)
-            
+
             hidden_dim = 384
 
             self.mp_layers = nn.ModuleList([
                 nn.Sequential(
-                nn.Conv2d(((self.Temb * 2 + feat_inp_dim) if i == 0 else hidden_dim) + i + layer_start_offset, hidden_dim, 
+                nn.Conv2d(((self.Temb * 2 + feat_inp_dim) if i == 0 else hidden_dim) + i + layer_start_offset, hidden_dim,
                         kernel_size=3, stride=1, padding=1),
                 nn.InstanceNorm2d(hidden_dim, affine=True) if self.use_mask_inst_norm else nn.BatchNorm2d(hidden_dim),
                 nn.ReLU(),
@@ -672,7 +881,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 for i in range(num_mask_regression_layers)
             ])
             self.mask_deconv = nn.Sequential(
-                nn.ConvTranspose2d(hidden_dim + num_mask_regression_layers + layer_start_offset, 
+                nn.ConvTranspose2d(hidden_dim + num_mask_regression_layers + layer_start_offset,
                                 hidden_dim, kernel_size=2, stride=2, padding=0),
                 nn.InstanceNorm2d(hidden_dim, affine=True) if self.use_mask_inst_norm else nn.BatchNorm2d(hidden_dim),
                 nn.ReLU()
@@ -682,8 +891,8 @@ class OpenSetDetectorWithExamples(nn.Module):
             if self.only_train_mask:
                 self.turn_off_box_training(force=True)
                 self.turn_off_cls_training(force=True)
-            
-    
+
+
     def turn_off_cls_training(self, force=False):
         self._turn_off_modules([
             self.fc_intra_class,
@@ -713,7 +922,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
     def _turn_off_modules(self, modules, force):
         for m in modules:
-            if m.training or force: 
+            if m.training or force:
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
@@ -763,11 +972,11 @@ class OpenSetDetectorWithExamples(nn.Module):
             "roialign_size": cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION,
 
             "offline_backbone": offline_backbone,
-            "offline_proposal_generator": offline_rpn, 
+            "offline_proposal_generator": offline_rpn,
             "offline_input_format": offline_cfg.INPUT.FORMAT if offline_cfg else None,
             "offline_pixel_mean": offline_cfg.MODEL.PIXEL_MEAN if offline_cfg else None,
             "offline_pixel_std": offline_cfg.MODEL.PIXEL_STD if offline_cfg else None,
-            
+
             "proposal_matcher": Matcher(
                 cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS,
                 cfg.MODEL.ROI_HEADS.IOU_LABELS,
@@ -784,31 +993,31 @@ class OpenSetDetectorWithExamples(nn.Module):
             "box_noise_scale": 0.5,
 
             "cls_temp": cfg.DE.TEMP,
-            
+
             "num_sample_class": cfg.DE.TOPK,
-            
-            
+
+
             "seen_cids": SEEN_CLS_DICT[cfg.DATASETS.TRAIN[0]],
             "all_cids": ALL_CLS_DICT[cfg.DATASETS.TRAIN[0]],
             "T_length": cfg.DE.T,
-            
+
             "bg_cls_weight": cfg.DE.BG_CLS_LOSS_WEIGHT,
             "batch_size_per_image": cfg.DE.RCNN_BATCH_SIZE,
             "pos_ratio": cfg.DE.POS_RATIO,
-            
+
             "mult_rpn_score": cfg.DE.MULTIPLY_RPN_SCORE,
 
             "num_cls_layers": cfg.DE.NUM_CLS_LAYERS,
-            
+
             "use_one_shot": cfg.DE.ONE_SHOT_MODE,
             "one_shot_reference": cfg.DE.ONE_SHOT_REFERENCE,
-            
+
             "only_train_mask": cfg.DE.ONLY_TRAIN_MASK,
             "use_mask": cfg.MODEL.MASK_ON,
-            
+
             "vit_feat_name": vit_feat_name
         }
-    
+
     def prepare_noisy_boxes(self, gt_boxes, image_shape):
         noisy_boxes = []
 
@@ -817,7 +1026,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         for box in gt_boxes:
             box = box.repeat(5, 1) # duplicate more noisy boxes
-            box_ccwh = box_xyxy_to_cxcywh(box) 
+            box_ccwh = box_xyxy_to_cxcywh(box)
 
             diff = torch.zeros_like(box_ccwh)
             diff[:, :2] = box_ccwh[:, 2:] / 2
@@ -825,7 +1034,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
             rand_sign = (
                 torch.randint_like(box_ccwh, low=0, high=2, dtype=torch.float32) * 2.0 - 1.0
-            ) 
+            )
             rand_part = torch.rand_like(box_ccwh) * rand_sign
             box_ccwh = box_ccwh + torch.mul(rand_part, diff).cuda() * self.box_noise_scale
 
@@ -839,8 +1048,8 @@ class OpenSetDetectorWithExamples(nn.Module):
             noisy_boxes.append(noisy_box)
 
         return noisy_boxes
-    
-    
+
+
     def mask_forward(self, features, boxes, class_labels, class_weights, gt_masks=None, feature_dict=None):
         # all the boxes, labels here are foreground only
         # return pred mask when infernce, or dict of losses when training
@@ -868,7 +1077,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         if boxes.shape[1] == 4:
             boxes = torch.cat([torch.zeros(len(boxes), 1, device=self.device), boxes], dim=1)
-        
+
         roi_feats = self.mask_roi_align(features, boxes)
         roi_feats = roi_feats.flatten(2) # N x C x K2
 
@@ -881,30 +1090,30 @@ class OpenSetDetectorWithExamples(nn.Module):
         fg_roi_emb = distance_embed(fg_roi_feats, num_pos_feats=self.Tpos_emb)
         fg_roi_emb = self.mask_intra_dist_emb(fg_roi_emb)
 
-        bg_roi_emb = bg_roi_emb.permute(0, 2, 1).reshape(N, self.Temb, 
+        bg_roi_emb = bg_roi_emb.permute(0, 2, 1).reshape(N, self.Temb,
                                                         self.mask_roialign_size, self.mask_roialign_size)
-        fg_roi_emb = fg_roi_emb.permute(0, 2, 1).reshape(N, self.Temb, 
+        fg_roi_emb = fg_roi_emb.permute(0, 2, 1).reshape(N, self.Temb,
                                                         self.mask_roialign_size, self.mask_roialign_size)
-        # N x (emb*2) x K x K        
-        embedding = torch.cat([fg_roi_emb, bg_roi_emb], dim=1) 
+        # N x (emb*2) x K x K
+        embedding = torch.cat([fg_roi_emb, bg_roi_emb], dim=1)
         masks = []
         loss_dict = {}
 
         if self.use_init_mask:
             init_mask = self.fc_init_mask(fg_roi_feats.reshape(N, 1, self.mask_roialign_size, self.mask_roialign_size))
             if self.training:
-                loss_dict[f"mask_bce_loss_0"] = sigmoid_ce_loss(init_mask.flatten(1), 
+                loss_dict[f"mask_bce_loss_0"] = sigmoid_ce_loss(init_mask.flatten(1),
                                                                 gt_masks_middle.flatten(1), num_masks)
-                loss_dict[f"mask_dice_loss_0"] = dice_loss(init_mask.flatten(1), 
+                loss_dict[f"mask_dice_loss_0"] = dice_loss(init_mask.flatten(1),
                                                             gt_masks_middle.flatten(1), num_masks)
-            masks.append(init_mask.sigmoid()) 
-        
+            masks.append(init_mask.sigmoid())
+
         if self.use_mask_feat_input:
             if self.use_mask_ms_feat:
                 assert feature_dict is not None
                 ms_feats = [self.mask_roi_align(feature_dict[k], boxes) for k in sorted(feature_dict.keys())] + [roi_feats]
                 ms_feats = [m.reshape(N, -1, self.mask_roialign_size, self.mask_roialign_size) for m in ms_feats]
-                feat_embs = [self.mask_feat_compress[i](ms_feats[i]) for i in range(3)]    
+                feat_embs = [self.mask_feat_compress[i](ms_feats[i]) for i in range(3)]
                 embedding = torch.cat([embedding] + feat_embs, dim=1)
             else:
                 roi_feats = roi_feats.reshape(N, -1, self.mask_roialign_size, self.mask_roialign_size)
@@ -925,17 +1134,17 @@ class OpenSetDetectorWithExamples(nn.Module):
             masks.insert(0, pred_mask_logits.sigmoid())
 
             if self.training:
-                loss_dict[f"mask_bce_loss_{len(masks) - 1}"] = sigmoid_ce_loss(pred_mask_logits.flatten(1), 
+                loss_dict[f"mask_bce_loss_{len(masks) - 1}"] = sigmoid_ce_loss(pred_mask_logits.flatten(1),
                                                                 gt_masks_middle.flatten(1), num_masks)
-                loss_dict[f"mask_dice_loss_{len(masks) - 1}"] = dice_loss(pred_mask_logits.flatten(1), 
+                loss_dict[f"mask_dice_loss_{len(masks) - 1}"] = dice_loss(pred_mask_logits.flatten(1),
                                                             gt_masks_middle.flatten(1), num_masks)
-                
+
                 if self.use_focal_mask:
                     loss_dict[f"mask_focal_loss_{len(masks) - 1}"] = sigmoid_focal_loss(
                         pred_mask_logits.flatten(1), gt_masks_middle.flatten(1),
                         alpha=-1, gamma=2.0, reduction="mean")
-                
-        
+
+
         all_mask_tensor = torch.cat(masks, dim=1)
         embedding = torch.cat([embedding, all_mask_tensor], dim=1)
         embedding = self.mask_deconv(embedding)
@@ -945,31 +1154,39 @@ class OpenSetDetectorWithExamples(nn.Module):
             mask_logits = self.mask_predictor(embedding) / mask_temperature
 
         if self.training:
-            loss_dict[f"mask_bce_loss_out"] = sigmoid_ce_loss(mask_logits.flatten(1), 
+            loss_dict[f"mask_bce_loss_out"] = sigmoid_ce_loss(mask_logits.flatten(1),
                                                                 gt_masks_final.flatten(1), num_masks)
-            loss_dict[f"mask_dice_loss_out"] = dice_loss(mask_logits.flatten(1), 
+            loss_dict[f"mask_dice_loss_out"] = dice_loss(mask_logits.flatten(1),
                                                             gt_masks_final.flatten(1), num_masks)
 
             if self.use_focal_mask:
                 loss_dict[f"mask_focal_loss_out"] = sigmoid_focal_loss(
                         mask_logits.flatten(1), gt_masks_final.flatten(1),
-                        alpha=-1, gamma=2.0, reduction="mean") 
-    
+                        alpha=-1, gamma=2.0, reduction="mean")
+
         if self.training:
             return loss_dict
         else:
             return mask_logits.sigmoid()
 
 
-    
+
     def forward(self, batched_inputs: List[Dict[str, torch.Tensor]]):
         bs = len(batched_inputs)
         loss_dict = {}
         if not self.training: assert bs == 1
 
+        self.sample_num = 16
+        use_novel_sample = False
         if self.training:
             class_weights = self.train_class_weight
+            self.label_idx = self.train_label_idx
+            self.RoIs_list = self.train_RoIs_list
         else:
+            # self.label_idx = self.test_label_idx
+            # self.RoIs_list = self.test_RoIs_list
+            self.sample_num = 16
+            use_novel_sample = True
             if self.use_one_shot:
                 # assemble weights on the fly
                 class_weights = []
@@ -983,29 +1200,33 @@ class OpenSetDetectorWithExamples(nn.Module):
                 class_weights = F.normalize(torch.stack(class_weights), dim=-1)
                 class_weights = class_weights.to(self.device)
             else:
+                # print("using the test class weight")
+                # print("num_classes", len(self.test_class_weight))
                 class_weights = self.test_class_weight
+                # print("class_weights", class_weights.shape)
 
         num_classes = len(class_weights)
+        # print("num_classes", num_classes)
 
         with torch.no_grad():
             # with autocast(enabled=True):
-            if self.offline_backbone.training or self.offline_proposal_generator.training:  
-                self.offline_backbone.eval() 
-                self.offline_proposal_generator.eval()  
+            if self.offline_backbone.training or self.offline_proposal_generator.training:
+                self.offline_backbone.eval()
+                self.offline_proposal_generator.eval()
             images = self.offline_preprocess_image(batched_inputs)
             features = self.offline_backbone(images.tensor)
-            proposals, _ = self.offline_proposal_generator(images, features, None)     
+            proposals, _ = self.offline_proposal_generator(images, features, None)
             images = self.preprocess_image(batched_inputs)
-        
+
         with torch.no_grad():
             if self.backbone.training: self.backbone.eval()
             with autocast(enabled=True):
                 all_patch_tokens = self.backbone(images.tensor)
                 patch_tokens = all_patch_tokens[self.vit_feat_name]
                 all_patch_tokens.pop(self.vit_feat_name)
-                # patch_tokens = self.backbone(images.tensor)['res11'] 
+                # patch_tokens = self.backbone(images.tensor)['res11']
 
-        if self.training or self.use_one_shot: 
+        if self.training or self.use_one_shot:
             with torch.no_grad():
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 gt_boxes = [x.gt_boxes.tensor for x in gt_instances]
@@ -1014,7 +1235,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # could try to use only gt_boxes to see the accuracy
                 if self.training:
                     noisy_boxes = self.prepare_noisy_boxes(gt_boxes, images.tensor.shape)
-                    boxes = [torch.cat([gt_boxes[i], noisy_boxes[i], rpn_boxes[i]]) 
+                    boxes = [torch.cat([gt_boxes[i], noisy_boxes[i], rpn_boxes[i]])
                             for i in range(len(batched_inputs))]
                 else:
                     boxes = rpn_boxes
@@ -1039,7 +1260,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                         class_labels_i = torch.zeros_like(matched_idxs)
                     class_labels_i[matched_labels == 0] = num_classes
                     class_labels_i[matched_labels == -1] = -1
-                    
+
                     if self.training or self.evaluation_shortcut:
                         positive = ((class_labels_i != -1) & (class_labels_i != num_classes)).nonzero().flatten()
                         negative = (class_labels_i == num_classes).nonzero().flatten()
@@ -1062,7 +1283,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
                     proposals_per_image = proposals_per_image[sampled_idxs]
                     class_labels_i = class_labels_i[sampled_idxs]
-                    
+
                     if len(targets_per_image.gt_boxes.tensor) > 0:
                         gt_boxes_i = targets_per_image.gt_boxes.tensor[matched_idxs[sampled_idxs]]
                         if self.use_mask:
@@ -1080,7 +1301,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
                     num_bg_samples.append((class_labels_i == num_classes).sum().item())
                     num_fg_samples.append(class_labels_i.numel() - num_bg_samples[-1])
-                
+
                 if self.training:
                     storage = get_event_storage()
                     storage.put_scalar("fg_count", np.mean(num_fg_samples))
@@ -1090,34 +1311,252 @@ class OpenSetDetectorWithExamples(nn.Module):
                 matched_gt_boxes = torch.cat(matched_gt_boxes) # for regression purpose.
                 if self.use_mask:
                     gt_masks = PolygonMasks.cat(gt_masks)
-                
+
                 rois = []
                 for bid, box in enumerate(resampled_proposals):
-                    batch_index = torch.full((len(box), 1), fill_value=float(bid)).to(self.device) 
+                    batch_index = torch.full((len(box), 1), fill_value=float(bid)).to(self.device)
                     rois.append(torch.cat([batch_index, box], dim=1))
                 rois = torch.cat(rois)
         else:
-            boxes = proposals[0].proposal_boxes.tensor 
-            rois = torch.cat([torch.full((len(boxes), 1), fill_value=0).to(self.device) , 
+            boxes = proposals[0].proposal_boxes.tensor
+            rois = torch.cat([torch.full((len(boxes), 1), fill_value=0).to(self.device) ,
                             boxes], dim=1)
 
         roi_features = self.roi_align(patch_tokens, rois) # N, C, k, k
+        # print("shape of roi_features", roi_features.shape)
         roi_bs = len(roi_features)
+        original_roi_features = roi_features
 
         # roi_features # N x emb x spatial
         #%% #! Classification
         if (self.training and (not self.only_train_mask)) or (not self.training):
-            roi_features = roi_features.flatten(2) 
+            roi_features = roi_features.flatten(2)
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
+            # if self.use_class_weights:
             # (N x spatial x emb) @ (emb x class) = N x spatial x class
-            feats = roi_features.transpose(-2, -1) @ class_weights.T
+            # feats = roi_features.transpose(-2, -1) @ class_weights.T
+            if not self.use_class_weights:
+                # get the sample RoI feature maps
+                class_RoIs = {}
+                sample_num = self.sample_num
+                for label, idxs in self.label_idx.items():
+                    # print(label, len(idxs))
+                    if len(idxs) < sample_num:
+                        selected_elements = [i for i in idxs]
+                        # print(selected_elements)
+                    else:
+                        # randomly select 20 RoIs without replacement
+                        selected_elements = random.sample(idxs, sample_num)
+                    # selected_RoIs = [self.RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
+                    # RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                    # # if RoIs.shape[0] < sample_num:
+                    # #     RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
+                    # class_RoIs[label] = RoIs
 
-            # sample topk classes
+                    selected_RoIs = [self.RoIs_list[i] for i in selected_elements]
+                    RoIs = torch.stack(selected_RoIs, dim=0)
+                    if RoIs.shape[0] < sample_num:
+                        # RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)], dim=0)
+                        # since the number of ROIs is not the same for each class, we need to pad the tensor
+
+                        # Calculate repeat times and remainder
+                        repeat_times = sample_num // RoIs.size(0)
+                        remainder = sample_num % RoIs.size(0)
+
+                        # Repeat the tensor
+                        padded_tensor = RoIs.repeat(repeat_times, 1, 1, 1)
+
+                        # Handle the remainder
+                        if remainder:
+                            extra_part = RoIs[:remainder]
+                            RoIs = torch.cat((padded_tensor, extra_part), dim=0)
+                    class_RoIs[label] = RoIs
+
+                if use_novel_sample:
+                    for label, idxs in self.test_label_idx.items():
+                        # print(label, len(idxs))
+                        if len(idxs) < sample_num:
+                            selected_elements = [i for i in idxs]
+                            # print(selected_elements)
+                        else:
+                            # randomly select 20 RoIs without replacement
+                            selected_elements = random.sample(idxs, sample_num)
+                        # selected_RoIs = [self.test_RoIs_list[i].flatten(1).mean(dim=1, keepdim=True) for i in selected_elements]
+                        # RoIs = torch.cat(selected_RoIs, dim=1).permute(1, 0)
+                        # if RoIs.shape[0] < sample_num:
+                        #     RoIs = torch.cat([RoIs, torch.zeros(sample_num - RoIs.shape[0], RoIs.shape[1]).to(RoIs)], dim=0)
+                        # class_RoIs[label] = RoIs
+
+                        selected_RoIs = [self.test_RoIs_list[i] for i in selected_elements]
+                        RoIs = torch.stack(selected_RoIs, dim=0)
+                        if RoIs.shape[0] < sample_num:
+                            # Calculate repeat times and remainder
+                            repeat_times = sample_num // RoIs.size(0)
+                            remainder = sample_num % RoIs.size(0)
+                            # Repeat the tensor
+                            padded_tensor = RoIs.repeat(repeat_times, 1, 1, 1)
+
+                            # Handle the remainder
+                            if remainder:
+                                extra_part = RoIs[:remainder]
+                                RoIs = torch.cat((padded_tensor, extra_part), dim=0)
+                        class_RoIs[label] = RoIs
+
+
+                class_order = range(num_classes)
+                if use_novel_sample:
+                    class_order = self.coco_test_class_order
+
+                # pick top k samples from all sample RoIs, do not care the class
+                all_sample_mean_RoIs = []
+                all_sample_RoIs = []
+                for i in class_order:
+                    cur_sample_weights = class_RoIs[i].flatten(2).to(roi_features)  # sample num X C X spatial e.g. 16 x 768 x 49
+                    cur_mean = cur_sample_weights.mean(2) # sample num X C e.g. 16 x 768
+                    all_sample_RoIs.append(cur_sample_weights)
+                    all_sample_mean_RoIs.append(cur_mean)
+                all_sample_RoIs = torch.cat(all_sample_RoIs, dim=0).to(roi_features)  # (class x sample_num) x C x spatial, e.g. 960 x 768 x 49
+                all_sample_mean_RoIs = torch.cat(all_sample_mean_RoIs, dim=0).to(roi_features) # (class x sample_num) x C , e.g. 960 x 768
+
+                # to find the top k reference RoIs
+                topk_sample = True
+                tok_sample_num = 5
+                if topk_sample:
+                    init_sample_scores = F.normalize(roi_features.flatten(2).mean(2), dim=1) @ all_sample_mean_RoIs.T  # N x (class x sample_num) e.g.256x960
+                    topk_sample_indices = torch.topk(init_sample_scores, tok_sample_num, dim=1).indices # N x tok_sample_num
+                    topk_sample_indices = torch.sort(topk_sample_indices, dim=1).values
+                    topk_sample = all_sample_RoIs[topk_sample_indices] # N x tok_sample_num x C x spatial
+                    topk_sample = topk_sample.transpose(-2, -1) # N x tok_sample_num x spatial x C
+                    emb_size = topk_sample.shape[-1]
+                    topk_sample = topk_sample.reshape(bs, -1, emb_size)# N x (tok_sample_num x spatial) x emb
+                    # then we use these topk_sample to update the RoI features
+                    query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                    updated_roi_features = scaled_dot_product_attention(query_feature, topk_sample, topk_sample)
+                    feats = updated_roi_features @ class_weights.T
+                else:
+                    feats = roi_features.transpose(-2, -1) @ class_weights.T
+
+
+                # sorted_tensors = []
+                # for i in class_order:
+                #     sorted_tensors.append(class_RoIs[i].to(roi_features))
+                # img_supports = torch.stack(sorted_tensors, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # # img_supports = img_supports.repeat(bs, 1, 1, 1, 1)  # bs x class x sample_num x C x K x K
+                # img_supports = img_supports[None, :, :, :, :, :]
+                # img_query = original_roi_features # batch, C, K, K
+                # feats = self.cross_transformer(self.ctx_cnn_model, img_query, img_supports)
+                # class_similarity = []
+                # for i in class_order:
+                #     cur_class_weights = class_RoIs[i].to(roi_features)  # Value tensor
+                #     class_feats = cur_class_weights.repeat(bs, 1, 1)  # N x class x emb
+                #     # roi_features as query vectors, prototype as key vectors and value vectors
+                #     query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                #     # result = scaled_dot_product_attention(query_feature, class_feats, class_feats)
+                #     # attn_mask = None
+                #     # if class_feats.shape[1] < self.sample_num:
+                #     #     attn_mask = torch.zeros(bs, spatial_size, self.sample_num, device=self.device)
+                #     #     attn_mask[:, :, class_feats.shape[1]:] = -1e9
+                #     result = self.cross_attn(query_feature, class_feats, class_feats)
+                #     cur_class_similarity = - torch.mean((result - query_feature) ** 2, dim=-1)
+                #     class_similarity.append(cur_class_similarity)
+
+                # # use crossTransformers to get similarity matrix
+                # print("shape of original_roi_features", original_roi_features.shape)
+                # query_q, query_v = self.to_qk(self.pre_to_qk(original_roi_features)).flatten(2), self.to_v(self.pre_to_v(original_roi_features)).flatten(2)
+                # query_q, query_v = self.to_qk(original_roi_features).flatten(2), self.to_v(original_roi_features).flatten(2)
+                use_CTX_cls_logit = False
+                if use_CTX_cls_logit:
+                    query_q = original_roi_features.flatten(2)
+                    query_v = self.to_v(original_roi_features).flatten(2)
+                    query_q = query_q.transpose(-2, -1)  # N x spatial x emb
+                    query_v = query_v.transpose(-2, -1)  # N x spatial x emb
+
+                # sorted_class_RoIs = []
+                # class_supports_k = []
+                # class_supports_v = []
+                # for i in class_order:
+                #     cur_class_weights = class_RoIs[i].to(roi_features)
+                #     sorted_class_RoIs.append(cur_class_weights)
+                #     cur_class_supports_k, cur_class_supports_v = self.to_qk(cur_class_weights), self.to_v(cur_class_weights)
+                #     # print('cur_class_supports_k shape', cur_class_supports_k.shape)
+                #     class_supports_k.append(cur_class_supports_k)
+                #     class_supports_v.append(cur_class_supports_v)
+                # class_supports_k = torch.stack(class_supports_k, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # # print('class_supports_k shape', class_supports_k.shape)
+                # class_supports_v = torch.stack(class_supports_v, dim=0).to(roi_features)  # class x sample_num x C x K x K
+
+                # class_RoIs = torch.stack(sorted_class_RoIs, dim=0).to(roi_features)  # class x sample_num x C x K x K
+                # class_RoIs = class_RoIs.reshape(-1, *class_RoIs.shape[2:])  # (class*sample_num) x C x K x K
+                # # class_supports_k, class_supports_v = self.to_qk(self.pre_to_qk(class_RoIs)), self.to_v(self.pre_to_v(class_RoIs))
+                # class_supports_k, class_supports_v = self.to_qk(class_RoIs), self.to_v(class_RoIs)
+                # class_supports_k = class_supports_k.reshape(num_classes, -1, *class_supports_k.shape[1:])  # class x sample_num x C x K x K
+                # class_supports_v = class_supports_v.reshape(num_classes, -1, *class_supports_v.shape[1:])  # class x sample_num x C x K x K
+
+                    class_similarity = []
+                    for i in class_order:
+                        cur_class_weights = class_RoIs[i].to(roi_features)
+                        # supports_k, supports_v = self.to_qk(cur_class_weights), self.to_v(
+                        #     cur_class_weights)
+                        supports_k = cur_class_weights
+                        supports_v = self.to_v(cur_class_weights)
+                        supports_k = supports_k.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
+                        emb_size = supports_k.shape[-1]
+                        spatial_size = supports_k.shape[1]
+                        supports_v = supports_v.flatten(2).transpose(-2, -1)  # sample_num x spatial x emb
+                        supports_k = supports_k.reshape(-1, emb_size) # (sample_num*spatial) x emb
+                        supports_v = supports_v.reshape(-1, emb_size) # (sample_num*spatial) x emb
+                        # print('query_q shape', query_q.shape)
+                        # print('supports_k shape', supports_k.shape)
+                        supports_k = supports_k.repeat(bs, 1, 1)
+                        # print('after repeat supports_k shape', supports_k.shape)
+                        supports_v = supports_v.repeat(bs, 1, 1)
+                        # query_feature = query_q.transpose(-2, -1)  # N x spatial x emb
+                        result = scaled_dot_product_attention(query_q, supports_k, supports_v)
+                        # result = self.cross_attn(query_feature, class_feats, class_feats)
+                        cur_class_similarity = - ((result.flatten(1) - query_v.flatten(1)) ** 2).sum(dim = -1) / spatial_size  # bs, 1
+                        # cur_class_similarity = F.softmax(cur_class_similarity, dim=-1) # bs, spatial
+                        # print('cur_class_similarity shape', cur_class_similarity.shape)
+                        class_similarity.append(cur_class_similarity)
+
+                    cls_logits = torch.stack(class_similarity, dim=1)  # N x num_classes. e.g. 1000 x 34. 34 is the number of classes
+                    # get bg feats
+                    bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T  # N x spatial x back
+                    bg_dist_emb = self.fc_back_class(bg_feats)  # N x spatial x emb
+                    bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
+
+                # get bg logits for topk classes in CTX way
+                # bg_key = self.bg_to_qk(self.bg_tokens)
+                # bg_value = self.bg_to_v(self.bg_tokens)
+                #
+                # bg_key = bg_key.repeat(bs, 1, 1)  # N x class x emb
+                # bg_value = bg_value.repeat(bs, 1, 1)
+                # # query_feature = query_q.transpose(-2, -1)  # N x spatial x emb
+                # bg_result = scaled_dot_product_attention(query_q, bg_key, bg_value)
+                # # result = self.cross_attn(query_feature, class_feats, class_feats)
+                # bg_logits = - ((bg_result.flatten(1) - query_v.flatten(1)) ** 2).sum(dim=-1) / spatial_size  # bs
+                # bg_logits = bg_logits[:, None] # bs, 1
+
+                # print('bg_logits shape', bg_logits.shape)
+                # feats = class_similarity
+                # print('class similarity shape', class_similarity.shape)
+                # cls_logits = class_similarity.mean(dim=1) # N x num_classes
+                # print('cls_logits shape', cls_logits.shape)
+
+                # Sort the dictionary by keys and extract tensors
+                # sorted_tensors = [class_RoIs[k].mean(dim=0) for k in sorted(class_RoIs)]
+                # print('sorted tensor[0] shape', sorted_tensors[0].shape)
+
+                # Concatenate the tensors and reset class weights as the mean of sampled reference RoIs
+                # class_weights = torch.stack(sorted_tensors, dim=0)
+                # class_weights = class_weights.to(self.device)
+                # print('using sample weights, class weights shape', class_weights.shape)
+
+
             class_topk = self.num_sample_class
             class_indices = None
             if class_topk < 0:
                 class_topk = num_classes
-                sample_class_enabled = False           
+                sample_class_enabled = False
             else:
                 if class_topk == 0:
                     class_topk = num_classes
@@ -1136,81 +1575,101 @@ class OpenSetDetectorWithExamples(nn.Module):
                         if curr_label in topk_class_indices_i or curr_label == num_classes:
                             curr_indices = topk_class_indices_i
                         else:
-                            curr_indices = torch.cat([torch.as_tensor([curr_label]), 
+                            curr_indices = torch.cat([torch.as_tensor([curr_label]),
                                                 topk_class_indices_i[:-1]])
                         class_indices.append(curr_indices)
-                    class_indices = torch.stack(class_indices).to(self.device) 
+                    class_indices = torch.stack(class_indices).to(self.device)
                 else:
                     class_indices = topk_class_indices
-                
+
                 class_indices = torch.sort(class_indices, dim=1).values
             else:
                 num_active_classes = num_classes
+            # print("class_indices.shape", class_indices.shape)
+            # print("class_indices", class_indices[0])
+            # sys.exit()
+            if not use_CTX_cls_logit:
+                other_classes = []
+                if sample_class_enabled:
+                    indexes = torch.arange(0, num_classes, device=self.device)[None, None, :].repeat(bs, spatial_size, 1)
+                    for i in range(class_topk):
+                        cmask = indexes != class_indices[:, i].view(-1, 1, 1)
+                        _ = torch.gather(feats, 2, indexes[cmask].view(bs, spatial_size, num_classes - 1)) # N x spatial x classes-1
+                        other_classes.append(_[:, :, None, :])
+                else:
+                    for c in range(num_classes): # TODO: change to classes sampling during training for LVIS type datasets
+                        cmask = torch.ones(num_classes, device=self.device, dtype=torch.bool)
+                        cmask[c] = False
+                        _ = feats[:, :, cmask] # # N x spatial x classes-1
+                        other_classes.append(_[:, :, None, :])
 
-            other_classes = [] 
-            if sample_class_enabled:
-                indexes = torch.arange(0, num_classes, device=self.device)[None, None, :].repeat(bs, spatial_size, 1)
-                for i in range(class_topk):
-                    cmask = indexes != class_indices[:, i].view(-1, 1, 1)
-                    _ = torch.gather(feats, 2, indexes[cmask].view(bs, spatial_size, num_classes - 1)) # N x spatial x classes-1
-                    other_classes.append(_[:, :, None, :]) 
-            else:
-                for c in range(num_classes): # TODO: change to classes sampling during training for LVIS type datasets
-                    cmask = torch.ones(num_classes, device=self.device, dtype=torch.bool)
-                    cmask[c] = False
-                    _ = feats[:, :, cmask] # # N x spatial x classes-1
-                    other_classes.append(_[:, :, None, :]) 
-            
-            other_classes = torch.cat(other_classes, dim=2)  # N x spatial x classes x classes-1
-            other_classes = other_classes.permute(0, 2, 1, 3) # N x classes x spatial x classes-1
-            other_classes = other_classes.flatten(0, 1) # (Nxclasses) x spatial x classes-1
-            other_classes, _ = torch.sort(other_classes, dim=-1)
-            other_classes = interpolate(other_classes, self.T, mode='linear') # (Nxclasses) x spatial x T
-            other_classes = self.fc_other_class(other_classes) # (Nxclasses) x spatial x emb
-            other_classes = other_classes.permute(0, 2, 1) # (Nxclasses) x emb x spatial
-            # (Nxclasses) x emb x S x S
-            inter_dist_emb = other_classes.reshape(bs * num_active_classes, -1, self.roialign_size, self.roialign_size)
+                other_classes = torch.cat(other_classes, dim=2)  # N x spatial x classes x classes-1
+                other_classes = other_classes.permute(0, 2, 1, 3) # N x classes x spatial x classes-1
+                other_classes = other_classes.flatten(0, 1) # (Nxclasses) x spatial x classes-1
+                other_classes, _ = torch.sort(other_classes, dim=-1)
+                other_classes = interpolate(other_classes, self.T, mode='linear') # (Nxclasses) x spatial x T
+                other_classes = self.fc_other_class(other_classes) # (Nxclasses) x spatial x emb
+                other_classes = other_classes.permute(0, 2, 1) # (Nxclasses) x emb x spatial
+                # (Nxclasses) x emb x S x S
+                inter_dist_emb = other_classes.reshape(bs * num_active_classes, -1, self.roialign_size, self.roialign_size)
 
-            intra_feats = torch.gather(feats, 2, class_indices[:, None, :].repeat(1, spatial_size, 1)) if sample_class_enabled else feats
-            intra_dist_emb = distance_embed(intra_feats.flatten(0, 1), num_pos_feats=self.Tpos_emb) # (Nxspatial) x class x emb TODO: 可以再加一个 linear 层这里
-            intra_dist_emb = self.fc_intra_class(intra_dist_emb)
-            intra_dist_emb = intra_dist_emb.reshape(bs, spatial_size, num_active_classes, -1)
+                intra_feats = torch.gather(feats, 2, class_indices[:, None, :].repeat(1, spatial_size, 1)) if sample_class_enabled else feats
+                intra_dist_emb = distance_embed(intra_feats.flatten(0, 1), num_pos_feats=self.Tpos_emb) # (Nxspatial) x class x emb TODO: 可以再加一个 linear 层这里
+                intra_dist_emb = self.fc_intra_class(intra_dist_emb)
+                intra_dist_emb = intra_dist_emb.reshape(bs, spatial_size, num_active_classes, -1)
 
-            # (Nxclasses) x emb x S x S
-            intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1, 
-                                                                                    self.roialign_size, self.roialign_size)
+                # (Nxclasses) x emb x S x S
+                intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1,
+                                                                                        self.roialign_size, self.roialign_size)
 
-            bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
-            bg_dist_emb = self.fc_back_class(bg_feats) # N x spatial x emb
-            bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
-            # N x emb x S x S
+                bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
+                bg_dist_emb = self.fc_back_class(bg_feats) # N x spatial x emb
+                bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
+                # N x emb x S x S
 
-            bg_dist_emb_c = bg_dist_emb[:, None, :, :, :].expand(-1, num_active_classes, -1, -1, -1).flatten(0, 1)
-            # (Nxclasses) x emb x S x S
+                bg_dist_emb_c = bg_dist_emb[:, None, :, :, :].expand(-1, num_active_classes, -1, -1, -1).flatten(0, 1)
+                # (Nxclasses) x emb x S x S
 
-            # (Nxclasses) x EMB x S x S
-            per_cls_input = torch.cat([intra_dist_emb, inter_dist_emb, bg_dist_emb_c], dim=1)
+                # (Nxclasses) x EMB x S x S
+                per_cls_input = torch.cat([intra_dist_emb, inter_dist_emb, bg_dist_emb_c], dim=1)
+                # print('per_cls_input.shape', per_cls_input.shape)
+                # (Nxclasses) x 1
+                cls_logits = self.per_cls_cnn(per_cls_input)
+                # print('after cls cnn, cls_logits.shape', cls_logits)
 
-            # (Nxclasses) x 1
-            cls_logits = self.per_cls_cnn(per_cls_input)
-
-            # N x classes
-            if isinstance(cls_logits, list):
-                cls_logits = [v.reshape(bs, num_active_classes) for v in cls_logits]
-            else:
-                cls_logits = cls_logits.reshape(bs, num_active_classes)
+                # N x classes
+                if isinstance(cls_logits, list):
+                    # for v in cls_logits:
+                        # print('v.shape', v.shape)
+                    cls_logits = [v.reshape(bs, num_active_classes) for v in cls_logits]
+                else:
+                    cls_logits = cls_logits.reshape(bs, num_active_classes)
+                # print('num_active_classes', num_active_classes)
 
             # N x 1
             # feats: N x spatial x class
+            # if self.use_class_weights:
             cls_dist_feats = interpolate(torch.sort(feats, dim=2).values, self.T, mode='linear') # N x spatial x T
             bg_cls_dist_emb = self.fc_bg_class(cls_dist_feats) # N x spatial x emb
             bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
             bg_logits = self.bg_cnn(torch.cat([bg_cls_dist_emb, bg_dist_emb], dim=1))
 
+            if use_CTX_cls_logit:
+                # only pick topk classes logits
+                cls_logits = cls_logits[torch.arange(cls_logits.size(0))[:, None], class_indices]
+
+
             if isinstance(bg_logits, list):
                 logits = []
-                for c,b in zip(cls_logits, bg_logits):
+                for c, b in zip(cls_logits, bg_logits):
                     logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
+                # if self.use_class_weights:
+                #     for c,b in zip(cls_logits, bg_logits):
+                #         logits.append(torch.cat([c, b], dim=1) / self.cls_temp)
+                # else:
+                #     for b in bg_logits:
+                #         logits.append(torch.cat([cls_logits, b], dim=1) / self.cls_temp)
+
             else:
                 # N x (classes + 1)
                 logits = torch.cat([cls_logits, bg_logits], dim=1)
@@ -1223,29 +1682,30 @@ class OpenSetDetectorWithExamples(nn.Module):
         if (self.training and (not self.only_train_mask)) or (not self.training):
             H,W = images.tensor.shape[2:]
             if self.training:
-                fg_indices = class_labels != num_classes 
+                fg_indices = class_labels != num_classes
                 matched_gt_boxes = matched_gt_boxes[fg_indices] # nx4
                 fg_proposals = rois[fg_indices, 1:] # nx4
                 fg_batch_inds = rois[fg_indices, :1] # nx5
                 fg_class_labels = class_labels[fg_indices]
 
                 reg_bs = len(fg_proposals)
-                aug_rois, pred_roi_mask, gt_roi_mask, covered_flag = augment_rois(fg_proposals, matched_gt_boxes, img_h=H, img_w=W, pooler_size=self.reg_roialign_size, 
+                aug_rois, pred_roi_mask, gt_roi_mask, covered_flag = augment_rois(fg_proposals, matched_gt_boxes, img_h=H, img_w=W, pooler_size=self.reg_roialign_size,
                             min_expansion=0.4, expand_shortest=True)
                 aug_rois = torch.cat([fg_batch_inds, aug_rois], dim=1)
                 gt_region_coords = abs_coord_2_region_coord(aug_rois[:, 1:], matched_gt_boxes, self.reg_roialign_size)
 
-                storage = get_event_storage() 
+                storage = get_event_storage()
                 storage.put_scalar("roi_cover_ratio", covered_flag.sum().item() / covered_flag.numel())
             else:
+                # sample_class_enabled = True
                 reg_bs = len(rois)
-                aug_rois, pred_roi_mask, _, _ = augment_rois(rois[:, 1:], None, img_h=H, img_w=W, pooler_size=self.reg_roialign_size, 
+                aug_rois, pred_roi_mask, _, _ = augment_rois(rois[:, 1:], None, img_h=H, img_w=W, pooler_size=self.reg_roialign_size,
                             min_expansion=0.4, expand_shortest=True)
                 aug_rois = torch.cat([rois[:, :1], aug_rois], dim=1)
-            
+
             aroi_feats = self.reg_roi_align(patch_tokens, aug_rois) # N x C x K x K
             aroi_feats = aroi_feats.flatten(2) # N x C x K2
-            
+
             bg_aroi_feats = aroi_feats.transpose(-2, -1) @ self.bg_tokens.T # N x K2 x back
             bg_aroi_emb = self.reg_bg_dist_emb(bg_aroi_feats)  # N x K2 x T
 
@@ -1262,44 +1722,44 @@ class OpenSetDetectorWithExamples(nn.Module):
                 # fg_aroi_feats = torch.bmm(fg_aroi_feats, tmp)[:, :, 0]
                 fg_aroi_feats = torch.gather(fg_aroi_feats, 2, fg_class_labels[..., None, None].repeat(1, K2, 1))[:, :, 0]
 
-                fg_aroi_emb = distance_embed(fg_aroi_feats, num_pos_feats=self.Tpos_emb) # N x K2 x emb                   
+                fg_aroi_emb = distance_embed(fg_aroi_feats, num_pos_feats=self.Tpos_emb) # N x K2 x emb
                 fg_aroi_emb = self.reg_intra_dist_emb(fg_aroi_emb)
                 # N x emb x K x K
-                fg_aroi_emb = fg_aroi_emb.permute(0, 2, 1).reshape(reg_bs, self.Temb, 
+                fg_aroi_emb = fg_aroi_emb.permute(0, 2, 1).reshape(reg_bs, self.Temb,
                                                                 self.reg_roialign_size, self.reg_roialign_size)
-                # N x (emb*2) x K x K        
-                aroi_emb = torch.cat([fg_aroi_emb, bg_aroi_emb], dim=1) 
+                # N x (emb*2) x K x K
+                aroi_emb = torch.cat([fg_aroi_emb, bg_aroi_emb], dim=1)
             else:
                 # (NxK2) x class x emb
                 fg_aroi_dist_feats = torch.gather(fg_aroi_feats, 2, class_indices[:, None, :].repeat(1, K2, 1)) if sample_class_enabled else fg_aroi_feats
-                fg_aroi_emb = distance_embed(fg_aroi_dist_feats.flatten(0, 1), num_pos_feats=self.Tpos_emb) 
+                fg_aroi_emb = distance_embed(fg_aroi_dist_feats.flatten(0, 1), num_pos_feats=self.Tpos_emb)
                 fg_aroi_emb = self.reg_intra_dist_emb(fg_aroi_emb)
                 # N x K2 x class x emb
                 fg_aroi_emb = fg_aroi_emb.reshape(reg_bs, K2, num_active_classes, -1)
                 # (Nxclass) x emb x K x K
-                fg_aroi_emb = fg_aroi_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(reg_bs * num_active_classes, -1, 
+                fg_aroi_emb = fg_aroi_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(reg_bs * num_active_classes, -1,
                                                 self.reg_roialign_size, self.reg_roialign_size)
-                
-                bg_aroi_emb = bg_aroi_emb.permute(0, 2, 1).reshape(reg_bs, self.Temb, 
+
+                bg_aroi_emb = bg_aroi_emb.permute(0, 2, 1).reshape(reg_bs, self.Temb,
                                     self.reg_roialign_size, self.reg_roialign_size)[:, None, :, :, :].repeat(
                                         1, num_active_classes, 1, 1, 1).flatten(0, 1)
                 # (Nxclass) x (emb*2) x K x K
-                aroi_emb = torch.cat([fg_aroi_emb, bg_aroi_emb], dim=1) 
+                aroi_emb = torch.cat([fg_aroi_emb, bg_aroi_emb], dim=1)
                 # (Nxclass) x K x K
                 pred_roi_mask = pred_roi_mask[:, None, :, :].repeat(1, num_active_classes, 1, 1).flatten(0, 1)
-            
+
             masks = [pred_roi_mask[:, None, :, :].float(), ]
-            
+
             num_masks = len(pred_roi_mask)
-            # gt_region_coords 
+            # gt_region_coords
             embedding = aroi_emb
 
-            if not self.training: 
+            if not self.training:
                 aug_rois = aug_rois[:, None, :].repeat(1, num_active_classes, 1).flatten(0, 1)
-                
+
 
             for i, (rp, rp_out) in enumerate([
-                            (self.rp1, self.rp1_out), 
+                            (self.rp1, self.rp1_out),
                             (self.rp2, self.rp2_out),
                             (self.rp3, self.rp3_out),
                             (self.rp4, self.rp4_out),
@@ -1337,7 +1797,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         else:
             if self.training:
                 self.turn_off_box_training()
-        
+
         #%% #! Loss Finalization and Post Processing
         if self.training:
             class_labels = class_labels.long()
@@ -1347,7 +1807,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                     fg_indices = class_labels != num_classes
 
                     class_labels[fg_indices] = (class_indices == class_labels.view(-1, 1)).nonzero()[:, 1]
-                    class_labels[bg_indices] = num_active_classes           
+                    class_labels[bg_indices] = num_active_classes
 
                 if isinstance(logits, list):
                     _log_classification_stats(logits[-1].detach(), class_labels)
@@ -1374,7 +1834,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                     loss_dict['bbox_loss'] = box_loss
                 else:
                     loss_dict['bbox_loss'] = torch.zeros(1, device=self.device)
-                
+
             if self.use_mask:
                 loss_dict.update(
                     self.mask_forward(patch_tokens, rois[fg_indices],
@@ -1410,7 +1870,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
                     all_scores.append(_scores)
                     all_boxes.append(_boxes)
-                
+
                 if len(all_scores) == 0:
                     return []
                 else:
@@ -1431,13 +1891,13 @@ class OpenSetDetectorWithExamples(nn.Module):
                     scores = full_scores
                     output['scores'] = full_scores[:, :-1]
                     predict_boxes = full_boxes
-            
-            
+
+
             if self.mult_rpn_score:
                 rpn_scores = [x.objectness_logits for x in proposals][0]
                 rpn_scores[rpn_scores < 0] = 0
                 scores = (scores * rpn_scores[:, None]) ** 0.5
-            
+
             instances, _ = fast_rcnn_inference(
                     [predict_boxes],
                     [scores],
@@ -1451,14 +1911,15 @@ class OpenSetDetectorWithExamples(nn.Module):
                     self.test_topk_per_image,
                     scores_bf_multiply = [scores],
                     vis = False
-                ) 
+                )
 
             if self.use_mask:
-                instances[0].pred_masks = self.mask_forward(patch_tokens, 
+                instances[0].pred_masks = self.mask_forward(patch_tokens,
                                                         instances[0].pred_boxes.tensor,
-                                                        instances[0].pred_classes, 
+                                                        instances[0].pred_classes,
                                                         class_weights, feature_dict=all_patch_tokens)
 
             results = self._postprocess(instances, batched_inputs)
             output['instances'] = results[0]['instances']
             return [output, ]
+
