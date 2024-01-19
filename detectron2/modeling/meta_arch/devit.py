@@ -27,6 +27,7 @@ from detectron2.data.datasets.coco_zeroshot_categories import COCO_SEEN_CLS, \
 from ..roi_heads import build_roi_heads
 from ..matcher import Matcher
 from .build import META_ARCH_REGISTRY
+import sys
 
 
 from PIL import Image
@@ -49,6 +50,107 @@ from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    # Efficient implementation equivalent to the following:
+    # copy from pytorch: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
+class SinusoidalPositionalEncoding(torch.nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.encoding = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
+        self.encoding[:, 0::2] = torch.sin(position * div_term)
+        self.encoding[:, 1::2] = torch.cos(position * div_term)
+        self.encoding = self.encoding.unsqueeze(0)
+
+    def forward(self, x):
+        self.encoding = self.encoding.to(x.device)
+        return x + self.encoding[:, :x.size(1)]
+class LearnedPositionalEncoding(torch.nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.positional_embedding = torch.nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        positions = torch.arange(0, x.size(1), device=x.device).unsqueeze(0).repeat(x.size(0), 1)
+        return x + self.positional_embedding(positions)
+
+class CrossAttention(nn.Module):
+    def __init__(self, embed_size):
+        super(CrossAttention, self).__init__()
+        num_heads = 8  # Number of heads in multi-head attention
+        dropout = 0.4  # Dropout rate
+        self.query_linear = nn.Linear(embed_size, embed_size)
+        self.key_linear = nn.Linear(embed_size, embed_size)
+        self.value_linear = nn.Linear(embed_size, embed_size)
+        self.norm = nn.LayerNorm(embed_size)
+        self.dropout = nn.Dropout(dropout)
+        self.multihead_attn = nn.MultiheadAttention(embed_size, num_heads, dropout=0.0,  batch_first=True)
+        # self.positional_encoding = LearnedPositionalEncoding(embed_size)
+        self.positional_encoding = SinusoidalPositionalEncoding(embed_size)
+
+    def forward(self, query, key, value, mask=None):
+        query_with_pos = self.positional_encoding(query)
+        key_with_pos = self.positional_encoding(key)
+        # Apply linear transformations
+        query_transformed = self.query_linear(query_with_pos)
+        key_transformed = self.key_linear(key_with_pos)
+        value_transformed = self.value_linear(value)
+
+        # Scaled dot-product attention
+        attn_output, attn_output_weights = self.multihead_attn(query_transformed, key_transformed, value_transformed)
+        tgt = query + self.dropout(attn_output)
+        tgt = self.norm(tgt)
+
+        return tgt
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_size):
+        super(SelfAttention, self).__init__()
+        num_heads = 8  # Number of heads in multi-head attention
+        dropout = 0.4  # Dropout rate
+        self.query_linear = nn.Linear(embed_size, embed_size)
+        self.key_linear = nn.Linear(embed_size, embed_size)
+        self.value_linear = nn.Linear(embed_size, embed_size)
+        self.norm = nn.LayerNorm(embed_size)
+        self.dropout = nn.Dropout(dropout)
+        self.multihead_attn = nn.MultiheadAttention(embed_size, num_heads, dropout=0.0, batch_first=True)
+        self.positional_encoding = SinusoidalPositionalEncoding(embed_size)  # Assuming you have this class defined elsewhere
+
+    def forward(self, x, mask=None):
+        query_with_pos = key_with_pos = self.positional_encoding(x)
+        # Apply linear transformations
+        query_transformed = self.query_linear(query_with_pos)
+        key_transformed = self.key_linear(key_with_pos)
+        value_transformed = self.value_linear(x)
+
+
+        # Scaled dot-product attention
+        attn_output, attn_output_weights = self.multihead_attn(query_transformed, key_transformed, value_transformed, attn_mask=mask)
+        tgt = x + self.dropout(attn_output)
+        tgt = self.norm(tgt)
+
+        return tgt
 
 def generalized_box_iou(boxes1, boxes2) -> torch.Tensor:
     """
@@ -480,10 +582,14 @@ class OpenSetDetectorWithExamples(nn.Module):
             raise NotImplementedError()
 
         if len(prototypes.shape) == 3:
+            class_centers = F.normalize(prototypes, dim=-1)
             class_weights = F.normalize(prototypes.mean(dim=1), dim=-1)
         else:
+            warnings.warn("prototypes.shape[-1] != 3, class centers are one for each class")
+            class_centers = prototypes
             class_weights = F.normalize(prototypes, dim=-1)
-        
+
+
         self.num_train_classes = len(seen_cids)
         self.num_classes = len(all_cids)
 
@@ -502,6 +608,8 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         self.register_buffer("train_class_weight", class_weights[torch.as_tensor(train_class_order)])
         self.register_buffer("test_class_weight", class_weights[torch.as_tensor(test_class_order)])
+        self.register_buffer("train_class_centers", class_centers[torch.as_tensor(train_class_order)])
+        self.register_buffer("test_class_centers", class_centers[torch.as_tensor(test_class_order)])
         self.test_class_order = test_class_order
 
         self.all_labels = all_cids
@@ -523,8 +631,14 @@ class OpenSetDetectorWithExamples(nn.Module):
         if len(bg_protos.shape) == 3:
             bg_protos = bg_protos.flatten(0, 1)
         self.register_buffer("bg_tokens", bg_protos)
-        self.num_bg_tokens = len(self.bg_tokens)
-
+        self.num_bg_tokens = len(self.bg_tokens)  # NxC, e.g, 530 x 768
+        channel_dim = self.train_class_centers.shape[-1] # C
+        # fg: 60x10x768, class x num x C + bg: 530 x 768, num x C => e.g. torch.Size([1130, 768])
+        self.all_train_tokens = torch.cat([self.train_class_centers.reshape((-1, channel_dim)), self.bg_tokens], dim=0)
+        # fg: 80x10x768, class x num x C + bg: 530 x 768, num x C => e.g. torch.Size([1330, 768])
+        self.all_test_tokens = torch.cat([self.test_class_centers.reshape((-1, channel_dim)), self.bg_tokens], dim=0)
+        self.cross_attention = CrossAttention(channel_dim)
+        # self.self_attention = SelfAttention(channel_dim)
 
         self.roialign_size = roialign_size
         self.roi_align = ROIAlign(roialign_size, 1 / backbone.patch_size, sampling_ratio=-1)
@@ -615,6 +729,8 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         if use_one_shot:
             self.one_shot_ref = torch.load(one_shot_reference)
+
+
         
         # ---------- mask related layers --------- # 
         self.only_train_mask = only_train_mask if use_mask else False
@@ -969,6 +1085,7 @@ class OpenSetDetectorWithExamples(nn.Module):
 
         if self.training:
             class_weights = self.train_class_weight
+            class_centers = self.all_train_tokens.to(self.device)
         else:
             if self.use_one_shot:
                 # assemble weights on the fly
@@ -984,6 +1101,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 class_weights = class_weights.to(self.device)
             else:
                 class_weights = self.test_class_weight
+                class_centers = self.all_test_tokens.to(self.device)
 
         num_classes = len(class_weights)
 
@@ -1109,8 +1227,27 @@ class OpenSetDetectorWithExamples(nn.Module):
         if (self.training and (not self.only_train_mask)) or (not self.training):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
-            # (N x spatial x emb) @ (emb x class) = N x spatial x class
-            feats = roi_features.transpose(-2, -1) @ class_weights.T
+
+
+            # to find the top k reference tokens to update RoI features
+            topk_tokens = True
+            tok_sample_num = 5
+            if topk_tokens:
+                init_sample_scores = F.normalize(roi_features.flatten(2).mean(2),
+                                                 dim=1) @ class_centers.T  # N x (class x sample_num) e.g.256x960
+                topk_sample_indices = torch.topk(init_sample_scores, tok_sample_num,
+                                                 dim=1).indices  # N x tok_sample_num
+                topk_sample_indices = torch.sort(topk_sample_indices, dim=1).values
+                topk_sample = class_centers[topk_sample_indices]  # N x tok_sample_num x C
+                # then we use these topk_sample to update the RoI features
+                query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
+                updated_roi_features = self.cross_attention(query_feature, topk_sample, topk_sample)
+                # updated_roi_features = self.self_attention(updated_roi_features)
+                feats = updated_roi_features @ class_weights.T
+                # roi_features = updated_roi_features.transpose(-2, -1)
+            else:
+                # (N x spatial x emb) @ (emb x class) = N x spatial x class
+                feats = roi_features.transpose(-2, -1) @ class_weights.T
 
             # sample topk classes
             class_topk = self.num_sample_class
@@ -1180,7 +1317,8 @@ class OpenSetDetectorWithExamples(nn.Module):
             intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1, 
                                                                                     self.roialign_size, self.roialign_size)
 
-            bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
+            # bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
+            bg_feats = updated_roi_features @ self.bg_tokens.T  # N x spatial x back
             bg_dist_emb = self.fc_back_class(bg_feats) # N x spatial x emb
             bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
             # N x emb x S x S
