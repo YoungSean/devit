@@ -4,8 +4,8 @@ import random
 # cur_patchs = "weights/initial/few-shot/prototypes/fs_coco14_base_train.vitl14.pkl"
 # cur_patchs = "fs_coco17_support_novel_5shot.vitl14.bbox.pkl"
 # cur_patchs = "fs_coco_trainval_base.vitl14.bbox.pkl"
-cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples.bbox.pkl"
-# cur_patchs = 'weights/initial/few-shot/prototypes/fs_coco_trainval_novel_5shot.vitb14.pkl'
+# cur_patchs = "fs_coco_trainval_novel_5shot.vitb14_100_samples.bbox.pkl"
+cur_patchs = 'weights/initial/few-shot/prototypes/fs_coco_trainval_novel_5shot.vitb14.pkl'
 coco60 = torch.load(cur_patchs)
 # print(len(coco60['patch_tokens']))
 
@@ -30,36 +30,36 @@ fs_coco_2014_unseen_classes = ['person', 'bicycle', 'car', 'motorcycle', 'airpla
 #
 # cur_patchs = "fs_coco_trainval_base.vitb14_5000_samples.bbox.pkl"
 # coco60 = torch.load(cur_patchs)
-
-labels = coco60['labels']
-label_idx = defaultdict(list)
-for idx, label in enumerate(labels):
-    label_idx[label].append(idx)
-
-RoIs_list = coco60['RoI_feature_tokens']
-class_RoIs = {}
-for label, idxs in label_idx.items():
-    print(label, len(idxs))
-    # Select 30 elements with replacement
-    if len(idxs) < 30:
-        selected_elements = [ i for i in idxs]
-        print(selected_elements)
-    else:
-        selected_elements = random.sample(idxs, 30)
-    # print(selected_elements)
-    selected_RoIs = [RoIs_list[i] for i in selected_elements]
-    RoIs = torch.stack(selected_RoIs, dim=0)
-    if RoIs.shape[0] < 30:
-        RoIs = torch.cat([RoIs, torch.zeros(30 - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)], dim=0)
-    class_RoIs[label] = RoIs
-
-print(class_RoIs[0].shape)
-# Sort the dictionary by keys and extract tensors
-sorted_tensors = [class_RoIs[k] for k in sorted(class_RoIs)]
 #
-# # Concatenate the tensors
-combined_tensor = torch.stack(sorted_tensors, dim=0)
-print(combined_tensor.shape)  # class_num, sample_num, channel, height, width
+# labels = coco60['labels']
+# label_idx = defaultdict(list)
+# for idx, label in enumerate(labels):
+#     label_idx[label].append(idx)
+#
+# RoIs_list = coco60['RoI_feature_tokens']
+# class_RoIs = {}
+# for label, idxs in label_idx.items():
+#     print(label, len(idxs))
+#     # Select 30 elements with replacement
+#     if len(idxs) < 30:
+#         selected_elements = [ i for i in idxs]
+#         print(selected_elements)
+#     else:
+#         selected_elements = random.sample(idxs, 30)
+#     # print(selected_elements)
+#     selected_RoIs = [RoIs_list[i] for i in selected_elements]
+#     RoIs = torch.stack(selected_RoIs, dim=0)
+#     if RoIs.shape[0] < 30:
+#         RoIs = torch.cat([RoIs, torch.zeros(30 - RoIs.shape[0], *RoIs.shape[1:]).to(RoIs)], dim=0)
+#     class_RoIs[label] = RoIs
+#
+# print(class_RoIs[0].shape)
+# # Sort the dictionary by keys and extract tensors
+# sorted_tensors = [class_RoIs[k] for k in sorted(class_RoIs)]
+# #
+# # # Concatenate the tensors
+# combined_tensor = torch.stack(sorted_tensors, dim=0)
+# print(combined_tensor.shape)  # class_num, sample_num, channel, height, width
 # RoI_prototypes = []
 # for i in range(len(class_RoIs)):
 #     # print(class_RoIs[i].shape)

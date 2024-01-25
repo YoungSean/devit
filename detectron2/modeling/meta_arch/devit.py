@@ -50,6 +50,23 @@ from lib.dinov2.layers.block import Block
 from lib.regionprop import augment_rois, region_coord_2_abs_coord, abs_coord_2_region_coord, SpatialIntegral
 from lib.categories import SEEN_CLS_DICT, ALL_CLS_DICT
 
+
+class DenoisingCNN(nn.Module):
+    def __init__(self, channels):
+        super(DenoisingCNN, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # self.bn1 = nn.BatchNorm2d(channels)
+        # self.dropout1 = nn.Dropout(0.4)
+        # self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        # self.relu = nn.ReLU(inplace=True)
+        # self.conv2 = nn.Conv2d(256, channels, kernel_size=3, padding=1)
+        # self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        x = self.conv1(x)  # Apply BN after conv1 and before ReLU
+        return x
+
+
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
     # Efficient implementation equivalent to the following:
     # copy from pytorch: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
@@ -243,7 +260,7 @@ class PropagateNet(nn.Module):
             out = {}
 
             # -------- classification -------- #
-            mask_weights = mask_weights / mask_weights.sum(dim=[2, 3], keepdim=True)
+            mask_weights = mask_weights / mask_weights.sum(dim=[2, 3], keepdim=True)  #normalize
             latent = (embedding * mask_weights).sum(dim=[2, 3])
             
             # dropout
@@ -631,14 +648,21 @@ class OpenSetDetectorWithExamples(nn.Module):
         if len(bg_protos.shape) == 3:
             bg_protos = bg_protos.flatten(0, 1)
         self.register_buffer("bg_tokens", bg_protos)
+        # self.other_class_num = 100 # 100 learnable tokens for other classes (not in foreground or background)
+        # self.other_class_token = nn.Embedding(self.other_class_num, bg_protos.shape[-1])
+        # print("other class device: ", self.other_class_token.weight.device)
+        # print("shape of self.other_class_token.weight: ", self.other_class_token.weight.shape)
         self.num_bg_tokens = len(self.bg_tokens)  # NxC, e.g, 530 x 768
         channel_dim = self.train_class_centers.shape[-1] # C
         # fg: 60x10x768, class x num x C + bg: 530 x 768, num x C => e.g. torch.Size([1130, 768])
+        self.train_num_fg_tokens = self.train_class_centers.shape[0] * self.train_class_centers.shape[1]  # 60*10
+        self.test_num_fg_tokens = self.test_class_centers.shape[0] * self.test_class_centers.shape[1] # 80 * 10
         self.all_train_tokens = torch.cat([self.train_class_centers.reshape((-1, channel_dim)), self.bg_tokens], dim=0)
         # fg: 80x10x768, class x num x C + bg: 530 x 768, num x C => e.g. torch.Size([1330, 768])
         self.all_test_tokens = torch.cat([self.test_class_centers.reshape((-1, channel_dim)), self.bg_tokens], dim=0)
         self.cross_attention = CrossAttention(channel_dim)
-        # self.self_attention = SelfAttention(channel_dim)
+        self.self_attention = SelfAttention(channel_dim)
+        # self.denoising_cnn = DenoisingCNN(channel_dim)
 
         self.roialign_size = roialign_size
         self.roi_align = ROIAlign(roialign_size, 1 / backbone.patch_size, sampling_ratio=-1)
@@ -1086,6 +1110,10 @@ class OpenSetDetectorWithExamples(nn.Module):
         if self.training:
             class_weights = self.train_class_weight
             class_centers = self.all_train_tokens.to(self.device)
+            fg_class_centers = self.train_class_centers.to(self.device)
+            num_tokens = self.train_class_centers.shape[1]
+            fg_num_tokens = self.train_num_fg_tokens # 60 * 10
+            assert num_tokens == 10, "only support 10 tokens for now"
         else:
             if self.use_one_shot:
                 # assemble weights on the fly
@@ -1102,6 +1130,10 @@ class OpenSetDetectorWithExamples(nn.Module):
             else:
                 class_weights = self.test_class_weight
                 class_centers = self.all_test_tokens.to(self.device)
+                fg_class_centers = self.test_class_centers.to(self.device)
+                num_tokens = self.test_class_centers.shape[1]
+                fg_num_tokens = self.test_num_fg_tokens  # 60 * 10
+                assert num_tokens == 10, "only support 10 tokens for testing"
 
         num_classes = len(class_weights)
 
@@ -1219,7 +1251,9 @@ class OpenSetDetectorWithExamples(nn.Module):
             rois = torch.cat([torch.full((len(boxes), 1), fill_value=0).to(self.device) , 
                             boxes], dim=1)
 
-        roi_features = self.roi_align(patch_tokens, rois) # N, C, k, k
+        roi_features = self.roi_align(patch_tokens, rois) # N, C, k, k e.g. 256x768x7x7
+        # roi_features = self.denoising_cnn(roi_features) # N, C, k, k e.g.256x768x3x3
+        # roi_hw_size = roi_features.shape[-1]
         roi_bs = len(roi_features)
 
         # roi_features # N x emb x spatial
@@ -1228,21 +1262,52 @@ class OpenSetDetectorWithExamples(nn.Module):
             roi_features = roi_features.flatten(2) 
             bs, spatial_size = roi_features.shape[0], roi_features.shape[-1]
 
-
             # to find the top k reference tokens to update RoI features
             topk_tokens = True
-            tok_sample_num = 5
+            tok_sample_num = 10
+            class_centers = self.self_attention(class_centers.unsqueeze(0))[0] # use self-attention to update class centers
             if topk_tokens:
                 init_sample_scores = F.normalize(roi_features.flatten(2).mean(2),
                                                  dim=1) @ class_centers.T  # N x (class x sample_num) e.g.256x960
                 topk_sample_indices = torch.topk(init_sample_scores, tok_sample_num,
                                                  dim=1).indices  # N x tok_sample_num
                 topk_sample_indices = torch.sort(topk_sample_indices, dim=1).values
+
+                replace_tokens = False
+                if replace_tokens:
+                    token_idx = topk_sample_indices.flatten(0)
+                    # let us look at the idx of fg tokens
+                    fg_token_idx = token_idx[token_idx < fg_num_tokens]
+                    # Count the occurrences of each element
+                    element_counts = torch.bincount(fg_token_idx)
+                    replace_token = {}
+                    for i in range(num_classes):
+                        class_max_idx = -1
+                        most_common_num = 0
+                        for j in range(num_tokens):
+                            cur_token_idx = i * num_tokens + j
+                            if cur_token_idx > len(element_counts) - 1:
+                                break
+                            if element_counts[cur_token_idx] > most_common_num:
+                                class_max_idx = cur_token_idx
+                                most_common_num = element_counts[i * num_tokens + j]
+                        if most_common_num > 0:
+                            # print("class", i, "most common token", class_max_idx, "count", most_common_num)
+                            replace_token[i] = class_max_idx
+                    # according to replace_token, we replace the class_weight
+                    for k, v in replace_token.items():
+                        class_weights[k] = class_centers[v]
+
                 topk_sample = class_centers[topk_sample_indices]  # N x tok_sample_num x C
                 # then we use these topk_sample to update the RoI features
                 query_feature = roi_features.transpose(-2, -1)  # N x spatial x emb
                 updated_roi_features = self.cross_attention(query_feature, topk_sample, topk_sample)
-                # updated_roi_features = self.self_attention(updated_roi_features)
+                emd_size = updated_roi_features.shape[-1]
+                # updated_roi_features = F.normalize(updated_roi_features, dim=-1)
+                fg_class_centers = fg_class_centers.reshape(-1, emd_size)
+                feats = updated_roi_features @ fg_class_centers.T
+                feats = feats.reshape(bs, spatial_size, num_classes, -1)
+                feats, max_idxs = feats.max(dim=-1)
                 feats = updated_roi_features @ class_weights.T
                 # roi_features = updated_roi_features.transpose(-2, -1)
             else:
@@ -1307,20 +1372,27 @@ class OpenSetDetectorWithExamples(nn.Module):
             other_classes = other_classes.permute(0, 2, 1) # (Nxclasses) x emb x spatial
             # (Nxclasses) x emb x S x S
             inter_dist_emb = other_classes.reshape(bs * num_active_classes, -1, self.roialign_size, self.roialign_size)
+            # inter_dist_emb = other_classes.reshape(bs * num_active_classes, -1, roi_hw_size, roi_hw_size)
 
             intra_feats = torch.gather(feats, 2, class_indices[:, None, :].repeat(1, spatial_size, 1)) if sample_class_enabled else feats
+            # print("intra_feats shape: ", intra_feats.shape)
+            # sys.exit()
             intra_dist_emb = distance_embed(intra_feats.flatten(0, 1), num_pos_feats=self.Tpos_emb) # (Nxspatial) x class x emb TODO: 可以再加一个 linear 层这里
             intra_dist_emb = self.fc_intra_class(intra_dist_emb)
             intra_dist_emb = intra_dist_emb.reshape(bs, spatial_size, num_active_classes, -1)
 
             # (Nxclasses) x emb x S x S
-            intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1, 
+            intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1,
                                                                                     self.roialign_size, self.roialign_size)
+            # intra_dist_emb = intra_dist_emb.permute(0, 2, 3, 1).flatten(0, 1).reshape(bs * num_active_classes, -1,
+            #                                                                           roi_hw_size,
+            #                                                                           roi_hw_size)
 
             # bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
             bg_feats = updated_roi_features @ self.bg_tokens.T  # N x spatial x back
             bg_dist_emb = self.fc_back_class(bg_feats) # N x spatial x emb
             bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
+            # bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, roi_hw_size, roi_hw_size)
             # N x emb x S x S
 
             bg_dist_emb_c = bg_dist_emb[:, None, :, :, :].expand(-1, num_active_classes, -1, -1, -1).flatten(0, 1)
@@ -1343,6 +1415,7 @@ class OpenSetDetectorWithExamples(nn.Module):
             cls_dist_feats = interpolate(torch.sort(feats, dim=2).values, self.T, mode='linear') # N x spatial x T
             bg_cls_dist_emb = self.fc_bg_class(cls_dist_feats) # N x spatial x emb
             bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
+            # bg_cls_dist_emb = bg_cls_dist_emb.permute(0, 2, 1).reshape(bs, -1, roi_hw_size, roi_hw_size)
             bg_logits = self.bg_cnn(torch.cat([bg_cls_dist_emb, bg_dist_emb], dim=1))
 
             if isinstance(bg_logits, list):
