@@ -211,7 +211,7 @@ def interpolate(seq, T, mode='linear', force=False):
 class PropagateNet(nn.Module):
     
     def __init__(self, input_dim, hidden_dim, has_input_mask=False, num_layers=3, dropout=0.5, 
-                mask_temperature=0.1 # embedding | class
+                mask_temperature=0.1, threshold=0 # embedding | class
     ):
         super().__init__()
         self.has_input_mask = has_input_mask
@@ -222,20 +222,26 @@ class PropagateNet(nn.Module):
         self.mask_layers = nn.ModuleList()
         self.dropout = nn.Dropout(p=dropout)
         self.num_layers = num_layers
+        self.threshold = threshold # for class, threshold > 0; for bg, threshold = 0
+        # print("input dim", input_dim)
 
         for i in range(num_layers):
             channels = input_dim if i == 0 else hidden_dim
-            self.main_layers.append(nn.Sequential(
+            self.main_layers.append(  #SelfAttention(input_dim)
+                nn.Sequential(
                 nn.Conv2d(channels + start_mask_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
                 nn.BatchNorm2d(hidden_dim),
                 nn.ReLU(),
-            ))
+            )
+            )
 
             self.mask_layers.append(nn.Conv2d(hidden_dim, 1, kernel_size=3, stride=1, padding=1))
             start_mask_dim += 1
         
         # more proj for regression
         self.class_proj = nn.Linear(hidden_dim, 1)
+        # print("channels", input_dim)
+        # self.class_proj = nn.Linear(input_dim, 1)
 
     def forward(self, embedding, mask=None):
         masks = []
@@ -244,10 +250,13 @@ class PropagateNet(nn.Module):
             masks.append(mask.float())
         
         outputs = []
+        # embedding shape: B x C x H x W
+        # embedding = embedding.flatten(2).transpose(1, 2) # B x L x C, then use self attention layer
+
         for i in range(self.num_layers):
             if len(masks) > 0:
                 embedding = torch.cat([embedding,] + masks, dim=1)
-            
+
             embedding = self.main_layers[i](embedding)
 
             # merge2 (bad)
@@ -255,18 +264,20 @@ class PropagateNet(nn.Module):
 
             mask_logits = self.mask_layers[i](embedding) / self.mask_temperature
             mask_weights = mask_logits.sigmoid()
-            masks.insert(0, mask_weights) 
+            masks.insert(0, mask_weights)
 
             out = {}
 
             # -------- classification -------- #
             mask_weights = mask_weights / mask_weights.sum(dim=[2, 3], keepdim=True)  #normalize
             latent = (embedding * mask_weights).sum(dim=[2, 3])
+            # latent = embedding.mean(dim=1) # shape B x C
+            # latent = embedding.mean(dim=[2, 3])
             
             # dropout
             latent = self.dropout(latent)
-            
-            out['class'] = self.class_proj(latent)
+            prob = self.class_proj(latent).sigmoid()
+            out['class'] = prob - self.threshold
             outputs.append(out)
             
 
@@ -684,7 +695,7 @@ class OpenSetDetectorWithExamples(nn.Module):
         cls_input_dim = self.Temb * 2 + self.Tbg_emb
         bg_input_dim = self.Temb + self.Tbg_emb
         
-        self.per_cls_cnn = PropagateNet(cls_input_dim, hidden_dim, num_layers=num_cls_layers)
+        self.per_cls_cnn = PropagateNet(cls_input_dim, hidden_dim, num_layers=num_cls_layers, threshold=0.5)
         self.bg_cnn = PropagateNet(bg_input_dim, hidden_dim, num_layers=num_cls_layers)
 
         self.fc_bg_class = nn.Linear(self.T, self.Temb)
@@ -1266,6 +1277,8 @@ class OpenSetDetectorWithExamples(nn.Module):
             topk_tokens = True
             tok_sample_num = 10
             class_centers = self.self_attention(class_centers.unsqueeze(0))[0] # use self-attention to update class centers
+            # updated_fg_class_centers = class_centers[:num_classes*num_tokens]
+            # updated_bg_tokens = class_centers[num_classes*num_tokens:]
             if topk_tokens:
                 init_sample_scores = F.normalize(roi_features.flatten(2).mean(2),
                                                  dim=1) @ class_centers.T  # N x (class x sample_num) e.g.256x960
@@ -1308,7 +1321,7 @@ class OpenSetDetectorWithExamples(nn.Module):
                 feats = updated_roi_features @ fg_class_centers.T
                 feats = feats.reshape(bs, spatial_size, num_classes, -1)
                 feats, max_idxs = feats.max(dim=-1)
-                feats = updated_roi_features @ class_weights.T
+                # feats = updated_roi_features @ class_weights.T
                 # roi_features = updated_roi_features.transpose(-2, -1)
             else:
                 # (N x spatial x emb) @ (emb x class) = N x spatial x class
@@ -1389,8 +1402,10 @@ class OpenSetDetectorWithExamples(nn.Module):
             #                                                                           roi_hw_size)
 
             # bg_feats = roi_features.transpose(-2, -1) @ self.bg_tokens.T # N x spatial x back
-            bg_feats = updated_roi_features @ self.bg_tokens.T  # N x spatial x back
+            bg_feats = updated_roi_features @ self.bg_tokens.T  # N x spatial x back # updated_bg_tokens
+            # bg_feats = updated_roi_features @ updated_bg_tokens.T
             bg_dist_emb = self.fc_back_class(bg_feats) # N x spatial x emb
+            # bg_dist_emb = bg_feats.max(dim=-1, keepdim=True).values
             bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, self.roialign_size, self.roialign_size)
             # bg_dist_emb = bg_dist_emb.permute(0, 2, 1).reshape(bs, -1, roi_hw_size, roi_hw_size)
             # N x emb x S x S
